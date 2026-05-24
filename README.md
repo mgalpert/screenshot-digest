@@ -140,13 +140,16 @@ python3 screenshot_viewer.py --port 9000
 
 - **Visual grid** of every screenshot (thumbnails served straight from disk).
 - **Live text filter** across OCR text, summary, filename, and category.
-- **Filter chips** for category and keep/review/delete flag.
-- **Review queue.** Every shot starts as **Needs review** (badged in the grid);
-  the view defaults to that queue so it works like an inbox. Acting on a shot —
-  sending it to the bot, or toggling **Reviewed** in the modal — clears it from
-  the queue. Filter by *Needs review* / *Reviewed* anytime.
-- **Click any shot** for the full image + full OCR text, and **recategorize /
-  re-flag inline** — changes save straight back to the DB.
+- **Filter chips** for category and triage status.
+- **Triage lifecycle.** Every shot is in one of three states — **Needs review →
+  Reviewed → Archived**. New shots land in *Needs review* (badged in the grid),
+  and the view defaults to that queue so it works like an inbox. Acting on a shot
+  — sending it to the bot, or picking a status in the modal — moves it along;
+  *Archived* is the gentle "done with this" state (dimmed, not deleted).
+- **Click any shot** for the full image + **editable OCR text** and inline
+  **recategorize / restatus** — changes save straight back to the DB. Editing the
+  OCR and hitting send overwrites the stored text, so you clean up the data as
+  you go.
 
 > Thumbnails are snappier if you have Pillow (`pip install pillow`); without it
 > the viewer just serves the raw images.
@@ -174,6 +177,11 @@ export SCREENSHOT_ACTION_CHANNEL="telegram"   # default
 ```
 
 The action panel stays hidden until one of these is configured.
+
+**Quick messages.** Instead of hardcoded prompts, the panel shows *your* reusable
+instructions. Type one and hit **+ save current as quick message**; it's stored
+in `quick_messages.json` next to the DB and shown as a one-click chip on every
+shot (the `×` removes it). Starts empty — it fills with whatever you actually use.
 
 ---
 

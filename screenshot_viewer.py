@@ -84,7 +84,16 @@ CATEGORIES = [
     "conversation", "document", "misc", "photo_media", "product_ui",
     "receipt_financial", "social_media", "url_link", "map_location",
 ]
-FLAGS = ["keep", "review", "delete"]
+
+# Single triage lifecycle (replaces the old keep/review/delete flag). Every shot
+# is in exactly one state; acting on it (or sending it to the bot) moves it to
+# "reviewed", and "archived" is the gentle replacement for "delete".
+STATUSES = ["needs_review", "reviewed", "archived"]
+STATUS_LABELS = {"needs_review": "Needs review", "reviewed": "Reviewed", "archived": "Archived"}
+
+# User-managed quick messages (reusable instructions). Lives next to the DB so
+# it's editable and portable; NOT hardcoded in the UI.
+QMSG_PATH = HOME / "quick_messages.json"
 
 # Optional Pillow for fast thumbnails; falls back to serving the raw file.
 try:
@@ -116,27 +125,52 @@ def db():
 
 
 def ensure_schema():
-    """Auto-migrate: add the `reviewed` triage column if it's missing.
+    """Auto-migrate to the single `status` triage column. Idempotent.
 
-    `reviewed` is a 0/1 triage state separate from `flag` (keep/review/delete):
-    everything lands as 0 (Needs review) and flips to 1 (Reviewed) once you've
-    acted on it — most often by sending it to the bot. Idempotent, so it's safe
-    to run on every startup and keeps the public-repo schema in sync.
+    Replaces the old two-axis model (keep/review/delete `flag` + a `reviewed`
+    boolean) with one lifecycle: needs_review → reviewed, plus archived. On the
+    first run we backfill from whatever older columns exist so nothing is lost:
+    reviewed=1 → reviewed, flag='delete' → archived, everything else → needs_review.
     """
     conn = db()
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(screenshots)")}
-    if "reviewed" not in cols:
-        conn.execute("ALTER TABLE screenshots ADD COLUMN reviewed INTEGER DEFAULT 0")
+    if "status" not in cols:
+        conn.execute("ALTER TABLE screenshots ADD COLUMN status TEXT DEFAULT 'needs_review'")
+        # Backfill from the legacy columns (guarding for DBs that lack them).
+        if "reviewed" in cols:
+            conn.execute("UPDATE screenshots SET status='reviewed' WHERE COALESCE(reviewed,0)=1")
+        if "flag" in cols:
+            conn.execute("UPDATE screenshots SET status='archived' WHERE flag='delete'")
+        conn.execute("UPDATE screenshots SET status='needs_review' WHERE status IS NULL OR status=''")
         conn.commit()
     conn.close()
+
+
+def load_quick_messages():
+    try:
+        data = json.loads(QMSG_PATH.read_text())
+        return [str(x) for x in data if str(x).strip()] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_quick_messages(msgs):
+    seen, clean = set(), []
+    for m in msgs:
+        m = (m or "").strip()
+        if m and m not in seen:
+            seen.add(m)
+            clean.append(m)
+    QMSG_PATH.write_text(json.dumps(clean, indent=2))
+    return clean
 
 
 def fetch_all():
     conn = db()
     rows = conn.execute(
         "SELECT uuid, path, filename, date_taken, date_added, date_processed, "
-        "ocr_text, category, flag, summary, source, "
-        "COALESCE(reviewed, 0) AS reviewed FROM screenshots "
+        "ocr_text, category, summary, source, "
+        "COALESCE(NULLIF(status,''), 'needs_review') AS status FROM screenshots "
         "ORDER BY COALESCE(date_taken, date_added) DESC"
     ).fetchall()
     conn.close()
@@ -145,7 +179,7 @@ def fetch_all():
         d = dict(r)
         d["ocr_len"] = len(d.get("ocr_text") or "")
         d["exists"] = bool(d["path"] and os.path.exists(d["path"]))
-        d["reviewed"] = int(d.get("reviewed") or 0)
+        d["status"] = d.get("status") or "needs_review"
         out.append(d)
     return out
 
@@ -168,18 +202,23 @@ def _build_prompt(row, instruction, inc):
     return "\n".join(parts)
 
 
-def dispatch_action(uuid, instruction, include=None):
+def dispatch_action(uuid, instruction, include=None, ocr_override=None):
     """Hand a screenshot + instruction to the configured assistant.
 
     `include` picks which context to attach (keeps cost down — the image is
     the expensive part). Keys: image, ocr, summary, meta. Defaults: image OFF.
-    Runs detached so we don't block the HTTP response; output is logged so
-    failures are debuggable, not swallowed.
+    `ocr_override`, when provided, is saved back to the DB (cleaned-up text wins)
+    and used in the outgoing prompt. Runs detached so we don't block the HTTP
+    response; output is logged so failures are debuggable, not swallowed.
     """
     inc = {"image": False, "ocr": True, "summary": True, "meta": True}
     if include:
         inc.update({k: bool(v) for k, v in include.items() if k in inc})
     conn = db()
+    # Persist the edited OCR first so the prompt and the stored data agree.
+    if ocr_override is not None:
+        conn.execute("UPDATE screenshots SET ocr_text=? WHERE uuid=?", (ocr_override, uuid))
+        conn.commit()
     row = conn.execute(
         "SELECT filename, path, category, summary, ocr_text, date_taken, source "
         "FROM screenshots WHERE uuid=?", (uuid,)).fetchone()
@@ -244,11 +283,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
           user-select:none; transition:.12s; white-space:nowrap; }
   .chip:hover { color:var(--txt); }
   .chip.on { background:var(--accent); border-color:var(--accent); color:#fff; }
-  .chip.flag-keep.on{background:var(--keep);border-color:var(--keep)}
-  .chip.flag-review.on{background:var(--review);border-color:var(--review);color:#1a1a1a}
-  .chip.flag-delete.on{background:var(--delete);border-color:var(--delete)}
-  .chip.rev-needs.on{background:var(--review);border-color:var(--review);color:#1a1a1a}
-  .chip.rev-done.on{background:var(--keep);border-color:var(--keep);color:#08130d}
+  .chip.st-needs_review.on{background:var(--review);border-color:var(--review);color:#1a1a1a}
+  .chip.st-reviewed.on{background:var(--keep);border-color:var(--keep);color:#08130d}
+  .chip.st-archived.on{background:var(--muted);border-color:var(--muted);color:#0d0f14}
   #count { color:var(--muted); font-size:12px; margin-left:auto; }
   main { padding:18px; columns: 5 220px; column-gap:14px; }
   .card { break-inside:avoid; margin:0 0 14px; background:var(--panel); border:1px solid var(--line);
@@ -261,10 +298,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .tag { font-size:10px; padding:2px 7px; border-radius:6px; background:var(--panel2);
          color:var(--muted); }
   .dot { width:7px; height:7px; border-radius:50%; display:inline-block; }
-  .dot.keep{background:var(--keep)} .dot.review{background:var(--review)} .dot.delete{background:var(--delete)}
-  .needs-badge { position:absolute; top:8px; left:8px; z-index:2; font-size:10px; font-weight:600;
-                 padding:3px 8px; border-radius:999px; background:var(--review); color:#1a1a1a;
-                 box-shadow:0 1px 6px rgba(0,0,0,.4); }
+  .dot.needs_review{background:var(--review)} .dot.reviewed{background:var(--keep)} .dot.archived{background:var(--muted)}
+  .card.is-archived { opacity:.55; }
+  .status-badge { position:absolute; top:8px; left:8px; z-index:2; font-size:10px; font-weight:600;
+                  padding:3px 8px; border-radius:999px; box-shadow:0 1px 6px rgba(0,0,0,.4); }
+  .status-badge.needs_review { background:var(--review); color:#1a1a1a; }
+  .status-badge.archived { background:var(--muted); color:#0d0f14; }
   .missing { padding:30px 10px; text-align:center; color:var(--muted); font-size:11px; background:var(--panel2); }
   /* modal */
   #overlay { position:fixed; inset:0; background:rgba(0,0,0,.8); z-index:50; display:none;
@@ -283,12 +322,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 max-height:240px; overflow:auto; color:#c7ccd8; }
   .modal select { background:var(--panel2); color:var(--txt); border:1px solid var(--line);
                   border-radius:8px; padding:8px 10px; font-size:13px; width:100%; }
-  .flagbtns { display:flex; gap:8px; }
-  .flagbtns button { flex:1; padding:9px; border-radius:8px; border:1px solid var(--line);
-                     background:var(--panel2); color:var(--muted); cursor:pointer; font-size:12px; }
-  .flagbtns button.on.keep{background:var(--keep);color:#08130d;border-color:var(--keep)}
-  .flagbtns button.on.review{background:var(--review);color:#1a1a1a;border-color:var(--review)}
-  .flagbtns button.on.delete{background:var(--delete);color:#fff;border-color:var(--delete)}
+  .segbtns { display:flex; gap:8px; }
+  .segbtns button { flex:1; padding:9px; border-radius:8px; border:1px solid var(--line);
+                    background:var(--panel2); color:var(--muted); cursor:pointer; font-size:12px; }
+  .segbtns button:hover{ color:var(--txt); }
+  .segbtns button.on.needs_review{background:var(--review);color:#1a1a1a;border-color:var(--review)}
+  .segbtns button.on.reviewed{background:var(--keep);color:#08130d;border-color:var(--keep)}
+  .segbtns button.on.archived{background:var(--muted);color:#0d0f14;border-color:var(--muted)}
   .close { position:absolute; top:18px; right:24px; font-size:26px; color:#fff; cursor:pointer;
            z-index:60; line-height:1; opacity:.7; }
   .close:hover{opacity:1}
@@ -302,10 +342,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .incl { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:10px; font-size:12px; color:var(--muted); }
   .incl label { display:flex; align-items:center; gap:5px; cursor:pointer; }
   .incl input { accent-color:var(--accent); cursor:pointer; }
-  .preset { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
-  .preset button { font-size:11px; padding:5px 9px; border-radius:7px; border:1px solid var(--line);
-                   background:var(--panel2); color:var(--muted); cursor:pointer; }
-  .preset button:hover{ color:var(--txt); border-color:var(--accent); }
+  .qmsgs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  .qchip { display:inline-flex; align-items:center; gap:6px; font-size:11px; padding:5px 9px;
+           border-radius:7px; border:1px solid var(--line); background:var(--panel2); color:var(--muted); }
+  .qchip span { cursor:pointer; }
+  .qchip span:hover{ color:var(--txt); }
+  .qchip .x { opacity:.45; cursor:pointer; font-weight:700; }
+  .qchip .x:hover{ opacity:1; color:var(--delete); }
+  .qadd { font-size:11px; color:var(--accent); cursor:pointer; border:1px dashed var(--line);
+          background:none; padding:5px 9px; border-radius:7px; }
+  .qadd:hover{ border-color:var(--accent); }
+  .qmsg-empty { font-size:11px; color:var(--muted); }
+  #mOcr { width:100%; min-height:90px; max-height:240px; resize:vertical; background:var(--bg);
+          border:1px solid var(--line); border-radius:10px; padding:12px; color:#c7ccd8;
+          font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; outline:none; }
+  #mOcr:focus{ border-color:var(--accent); }
   #mAction { width:100%; min-height:64px; resize:vertical; background:var(--panel2); color:var(--txt);
              border:1px solid var(--line); border-radius:8px; padding:9px 11px; font-size:13px;
              font-family:inherit; outline:none; }
@@ -319,9 +370,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <header>
   <h1>📸 Screenshots <span id="total"></span></h1>
   <input id="search" placeholder="Filter by text, summary, filename…" autocomplete="off">
-  <div class="chips" id="reviewChips"></div>
+  <div class="chips" id="statusChips"></div>
   <div class="chips" id="catChips"></div>
-  <div class="chips" id="flagChips"></div>
   <div id="count"></div>
 </header>
 <main id="grid"></main>
@@ -339,12 +389,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <select id="mCat" onchange="saveCat()"></select>
       </div>
       <div>
-        <div class="label">Flag <span class="saved" id="savedFlag">saved ✓</span></div>
-        <div class="flagbtns" id="mFlags"></div>
-      </div>
-      <div>
-        <div class="label">Review <span class="saved" id="savedReview">saved ✓</span></div>
-        <div class="flagbtns"><button id="mReview" onclick="toggleReview()"></button></div>
+        <div class="label">Status <span class="saved" id="savedStatus">saved ✓</span></div>
+        <div class="segbtns" id="mStatus"></div>
       </div>
       <div id="actionBox">
         <div class="label">⚡ Send to <span id="botLabel"></span> <span class="saved" id="savedAction">on it ✓</span></div>
@@ -354,20 +400,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <label title="One-line summary — cheap"><input type="checkbox" id="incSummary" checked> summary</label>
           <label title="Sends the actual image — costs vision tokens, only if the bot must SEE it"><input type="checkbox" id="incImage"> 🖼 image (costly)</label>
         </div>
-        <div class="preset" id="presets"></div>
+        <div class="qmsgs" id="qmsgs"></div>
         <textarea id="mAction" placeholder="What should the bot do with this? (e.g. add this event to my calendar and find ticket prices)"></textarea>
         <button id="sendBtn" onclick="sendAction()">Send →</button>
         <div class="small" id="actionNote"></div>
       </div>
-      <div><div class="label">Full OCR text</div><div class="ocr" id="mOcr"></div></div>
+      <div>
+        <div class="label">OCR text <span class="small">(editable — saved on send)</span> <span class="saved" id="savedOcr">saved ✓</span></div>
+        <textarea id="mOcr" placeholder="(no text)"></textarea>
+      </div>
     </div>
   </div>
 </div>
 
 <script>
-let DATA = [], cur = null;
-// review filter defaults to the "Needs review" queue — that's the inbox.
-const state = { q:"", cats:new Set(), flags:new Set(), review:new Set(["needs"]) };
+let DATA = [], cur = null, QMSGS = [];
+// status filter defaults to the "Needs review" queue — that's the inbox.
+const state = { q:"", cats:new Set(), status:new Set(["needs_review"]) };
 
 // The ONE place image URLs are built. uuids can contain spaces, colons, and
 // U+202F (macOS screenshot names) — URLSearchParams encodes all of it safely,
@@ -380,18 +429,19 @@ function imgUrl(uuid, opts={}) {
 async function load() {
   DATA = await (await fetch('/api/screenshots')).json();
   document.getElementById('total').textContent = '· ' + DATA.length;
+  await loadQmsgs();
   buildChips();
   render();
 }
 
 function buildChips() {
-  const rc = document.getElementById('reviewChips');
-  [['needs','● Needs review'],['done','✓ Reviewed']].forEach(([v,label]) => {
+  const sc = document.getElementById('statusChips');
+  STATUSES.forEach(s => {
     const el = document.createElement('div');
-    el.className = 'chip rev-'+v + (state.review.has(v)?' on':'');
-    el.textContent = label;
-    el.onclick=()=>{ state.review.has(v)?state.review.delete(v):state.review.add(v); el.classList.toggle('on'); render(); };
-    rc.appendChild(el);
+    el.className = 'chip st-'+s + (state.status.has(s)?' on':'');
+    el.textContent = STATUS_LABELS[s];
+    el.onclick=()=>{ state.status.has(s)?state.status.delete(s):state.status.add(s); el.classList.toggle('on'); render(); };
+    sc.appendChild(el);
   });
   const cats = [...new Set(DATA.map(d=>d.category).filter(Boolean))].sort();
   const cc = document.getElementById('catChips');
@@ -401,22 +451,11 @@ function buildChips() {
     el.onclick=()=>{ state.cats.has(c)?state.cats.delete(c):state.cats.add(c); el.classList.toggle('on'); render(); };
     cc.appendChild(el);
   });
-  const fc = document.getElementById('flagChips');
-  ['keep','review','delete'].forEach(f => {
-    const el = document.createElement('div');
-    el.className='chip flag-'+f; el.textContent=f;
-    el.onclick=()=>{ state.flags.has(f)?state.flags.delete(f):state.flags.add(f); el.classList.toggle('on'); render(); };
-    fc.appendChild(el);
-  });
 }
 
 function match(d) {
-  if (state.review.size) {
-    const key = d.reviewed ? 'done' : 'needs';
-    if (!state.review.has(key)) return false;
-  }
+  if (state.status.size && !state.status.has(d.status||'needs_review')) return false;
   if (state.cats.size && !state.cats.has(d.category)) return false;
-  if (state.flags.size && !state.flags.has(d.flag)) return false;
   if (state.q) {
     const hay = ((d.ocr_text||'')+' '+(d.summary||'')+' '+(d.filename||'')+' '+(d.category||'')).toLowerCase();
     if (!hay.includes(state.q)) return false;
@@ -430,15 +469,17 @@ function render() {
   document.getElementById('count').textContent = items.length + ' shown';
   g.innerHTML = '';
   items.forEach(d => {
+    const st = d.status || 'needs_review';
     const card = document.createElement('div');
-    card.className='card'; card.onclick=()=>openModal(d);
+    card.className='card' + (st==='archived'?' is-archived':''); card.onclick=()=>openModal(d);
     const img = d.exists
       ? `<img loading="lazy" src="${imgUrl(d.uuid)}">`
       : `<div class="missing">image unavailable<br>${d.filename||''}</div>`;
-    const badge = d.reviewed ? '' : '<div class="needs-badge">needs review</div>';
+    const badge = (st==='needs_review') ? '<div class="status-badge needs_review">needs review</div>'
+                : (st==='archived') ? '<div class="status-badge archived">archived</div>' : '';
     card.innerHTML = badge + img + `<div class="meta">
         <p class="sum">${esc(d.summary||d.filename||'—')}</p>
-        <div class="tags"><span class="dot ${d.flag}"></span>
+        <div class="tags"><span class="dot ${st}"></span>
           <span class="tag">${d.category||'—'}</span></div></div>`;
     g.appendChild(card);
   });
@@ -454,43 +495,37 @@ function openModal(d) {
   document.getElementById('mDate').textContent =
      (d.source||'') + (d.date_taken? ' · '+d.date_taken : '');
   document.getElementById('mSum').textContent = d.summary || '—';
-  document.getElementById('mOcr').textContent = d.ocr_text || '(no text)';
+  document.getElementById('mOcr').value = d.ocr_text || '';
   const sel = document.getElementById('mCat'); sel.innerHTML='';
   CATS.forEach(c => { const o=document.createElement('option'); o.value=c; o.textContent=c;
      if(c===d.category)o.selected=true; sel.appendChild(o); });
   if (d.category && !CATS.includes(d.category)) {
      const o=document.createElement('option'); o.value=d.category; o.textContent=d.category; o.selected=true; sel.appendChild(o);
   }
-  const fb = document.getElementById('mFlags'); fb.innerHTML='';
-  ['keep','review','delete'].forEach(f => {
-    const b=document.createElement('button'); b.textContent=f; b.className=f+(f===d.flag?' on':'');
-    b.onclick=()=>saveFlag(f); fb.appendChild(b);
-  });
-  renderReviewBtn();
+  renderStatusBtns();
+  renderQmsgs();
   setupAction(d);
   document.getElementById('overlay').classList.add('on');
 }
 function closeModal(){ document.getElementById('overlay').classList.remove('on'); }
 
-function renderReviewBtn() {
-  const b = document.getElementById('mReview');
-  if (cur.reviewed) { b.textContent='✓ Reviewed — mark needs review'; b.className='keep on'; }
-  else { b.textContent='● Needs review — mark reviewed'; b.className='review on'; }
+function renderStatusBtns() {
+  const sb = document.getElementById('mStatus'); sb.innerHTML='';
+  const st = cur.status || 'needs_review';
+  STATUSES.forEach(s => {
+    const b=document.createElement('button'); b.textContent=STATUS_LABELS[s];
+    b.className=s+(s===st?' on':''); b.onclick=()=>saveStatus(s);
+    sb.appendChild(b);
+  });
 }
-async function toggleReview() {
-  const next = cur.reviewed ? 0 : 1;
-  await update(cur.uuid, {reviewed: next}); cur.reviewed = next;
-  renderReviewBtn(); flash('savedReview'); render();
+async function saveStatus(s) {
+  await update(cur.uuid, {status:s}); cur.status=s;
+  renderStatusBtns(); flash('savedStatus'); render();
 }
 async function saveCat() {
   const v = document.getElementById('mCat').value;
   await update(cur.uuid, {category:v}); cur.category=v;
   flash('savedCat'); render();
-}
-async function saveFlag(f) {
-  await update(cur.uuid, {flag:f}); cur.flag=f;
-  document.querySelectorAll('#mFlags button').forEach(b=>b.classList.toggle('on', b.textContent===f));
-  flash('savedFlag'); render();
 }
 async function update(uuid, fields) {
   await fetch('/api/update', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -504,15 +539,42 @@ document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
 document.getElementById('overlay').addEventListener('click', e=>{ if(e.target.id==='overlay') closeModal(); });
 
 const CATS = __CATS__;
+const STATUS_LABELS = __STATUS_LABELS__;
+const STATUSES = Object.keys(STATUS_LABELS);
 const ACTION_ENABLED = __ACTION_ENABLED__;
 const BOT_NAME = __BOT_NAME__;
-const PRESETS = [
-  "Add this to my calendar",
-  "Check my calendar for conflicts on the date here",
-  "Find prices / how much this costs",
-  "Draft a reply / follow-up email about this",
-  "Summarize and save the key info",
-];
+
+// ---- Quick messages (user-managed, pulled from the server; not hardcoded) ----
+async function loadQmsgs() {
+  try { QMSGS = (await (await fetch('/api/quickmsgs')).json()).messages || []; }
+  catch { QMSGS = []; }
+}
+function renderQmsgs() {
+  const box = document.getElementById('qmsgs'); box.innerHTML='';
+  QMSGS.forEach(t => {
+    const chip=document.createElement('div'); chip.className='qchip';
+    const lbl=document.createElement('span'); lbl.textContent=t;
+    lbl.onclick=()=>{ const a=document.getElementById('mAction'); a.value=(a.value?a.value+' ':'')+t; a.focus(); };
+    const x=document.createElement('span'); x.className='x'; x.textContent='×'; x.title='Remove';
+    x.onclick=(e)=>{ e.stopPropagation(); delQmsg(t); };
+    chip.append(lbl, x); box.appendChild(chip);
+  });
+  const add=document.createElement('button'); add.className='qadd'; add.textContent='+ save current as quick message';
+  add.onclick=saveCurrentAsQmsg; box.appendChild(add);
+  if (!QMSGS.length) { const e=document.createElement('span'); e.className='qmsg-empty';
+    e.textContent='No quick messages yet — type one below, then “+ save”.'; box.insertBefore(e, add); }
+}
+async function postQmsg(payload) {
+  QMSGS = (await (await fetch('/api/quickmsgs', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})).json()).messages || [];
+  renderQmsgs();
+}
+async function saveCurrentAsQmsg() {
+  const t = document.getElementById('mAction').value.trim();
+  if (!t) { document.getElementById('mAction').focus(); return; }
+  await postQmsg({text:t});
+}
+async function delQmsg(t) { await postQmsg({op:'delete', text:t}); }
 
 function setupAction(d) {
   const box = document.getElementById('actionBox');
@@ -522,10 +584,6 @@ function setupAction(d) {
   document.getElementById('sendBtn').textContent = 'Send to '+BOT_NAME+' →';
   document.getElementById('mAction').value = '';
   document.getElementById('actionNote').textContent = '';
-  const p = document.getElementById('presets'); p.innerHTML='';
-  PRESETS.forEach(t => { const b=document.createElement('button'); b.textContent=t;
-    b.onclick=()=>{ const a=document.getElementById('mAction'); a.value=(a.value?a.value+' ':'')+t; a.focus(); };
-    p.appendChild(b); });
 }
 
 async function sendAction() {
@@ -538,12 +596,14 @@ async function sendAction() {
     summary: document.getElementById('incSummary').checked,
     image: document.getElementById('incImage').checked,
   };
+  // Send the (possibly edited) OCR — the server saves it back, cleaning the data.
+  const ocr = document.getElementById('mOcr').value;
   const r = await (await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({uuid:cur.uuid, instruction, include})})).json();
+    body: JSON.stringify({uuid:cur.uuid, instruction, include, ocr})})).json();
   btn.disabled=false; btn.textContent='Send to '+BOT_NAME+' →';
-  if (r.ok) { flash('savedAction');
-    cur.reviewed = 1; renderReviewBtn(); render();  // sending counts as reviewing
-    document.getElementById('actionNote').textContent=BOT_NAME+' is on it — marked reviewed. Watch your chat for the reply.';
+  if (r.ok) { flash('savedAction'); flash('savedOcr');
+    cur.ocr_text = ocr; cur.status = 'reviewed'; renderStatusBtns(); render();  // sending counts as reviewing
+    document.getElementById('actionNote').textContent=BOT_NAME+' is on it — marked reviewed, OCR saved. Watch your chat for the reply.';
   } else { document.getElementById('actionNote').textContent='⚠ '+(r.error||r.msg||'failed'); }
 }
 
@@ -571,11 +631,14 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/":
             html = (INDEX_HTML
                     .replace("__CATS__", json.dumps(CATEGORIES))
+                    .replace("__STATUS_LABELS__", json.dumps(STATUS_LABELS))
                     .replace("__ACTION_ENABLED__", "true" if ACTION_ENABLED else "false")
                     .replace("__BOT_NAME__", json.dumps(BOT_NAME)))
             return self._send(200, html, "text/html; charset=utf-8")
         if u.path == "/api/screenshots":
             return self._send(200, json.dumps(fetch_all()))
+        if u.path == "/api/quickmsgs":
+            return self._send(200, json.dumps({"messages": load_quick_messages()}))
         if u.path == "/img":
             # uuid travels as a query param (?id=), NOT a path segment: desktop
             # uuids are "desktop:<filename>" and macOS screenshot names contain a
@@ -639,10 +702,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
-        if u.path not in ("/api/update", "/api/action"):
+        if u.path not in ("/api/update", "/api/action", "/api/quickmsgs"):
             return self._send(404, json.dumps({"error": "not found"}))
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or "{}")
+
+        # Quick-message list management (no uuid needed).
+        if u.path == "/api/quickmsgs":
+            msgs = load_quick_messages()
+            text = (body.get("text") or "").strip()
+            if body.get("op") == "delete":
+                msgs = [m for m in msgs if m != text]
+            elif text:
+                msgs.append(text)
+            return self._send(200, json.dumps({"messages": save_quick_messages(msgs)}))
+
         uuid = body.get("uuid")
         if not uuid:
             return self._send(400, json.dumps({"error": "uuid required"}))
@@ -654,20 +728,22 @@ class Handler(BaseHTTPRequestHandler):
             instruction = (body.get("instruction") or "").strip()
             if not instruction:
                 return self._send(400, json.dumps({"error": "instruction required"}))
-            ok, msg = dispatch_action(uuid, instruction, body.get("include"))
+            # Optional edited OCR — saved back so the data gets cleaned up over time.
+            ocr_override = body.get("ocr")
+            ok, msg = dispatch_action(uuid, instruction, body.get("include"), ocr_override=ocr_override)
             if ok:
                 # Acting on a shot counts as reviewing it — clear it from the queue.
                 conn = db()
-                conn.execute("UPDATE screenshots SET reviewed=1 WHERE uuid=?", (uuid,))
+                conn.execute("UPDATE screenshots SET status='reviewed' WHERE uuid=?", (uuid,))
                 conn.commit()
                 conn.close()
-            return self._send(200, json.dumps({"ok": ok, "msg": msg, "reviewed": ok}))
+            return self._send(200, json.dumps({"ok": ok, "msg": msg, "status": "reviewed" if ok else None}))
 
         sets, vals = [], []
-        for col in ("category", "flag", "summary", "reviewed"):
+        for col in ("category", "summary", "status", "ocr_text"):
             if col in body:
                 sets.append(f"{col}=?")
-                vals.append(int(body[col]) if col == "reviewed" else body[col])
+                vals.append(body[col])
         if not sets:
             return self._send(400, json.dumps({"error": "nothing to update"}))
         vals.append(uuid)
