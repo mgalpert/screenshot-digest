@@ -323,6 +323,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
             color:transparent; font-size:14px; font-weight:800; transition:.1s; }
   .selbox:hover { border-color:var(--accent); }
   .card.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent); }
+  .card.focused { outline:3px solid #fff; outline-offset:2px; }
+  .card.focused.selected { outline-color:var(--accent); }
+  /* keyboard shortcuts help overlay */
+  #help { position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:70; display:none;
+          align-items:center; justify-content:center; padding:30px; }
+  #help.on { display:flex; }
+  #help .card2 { background:var(--panel); border:1px solid var(--line); border-radius:16px;
+                 padding:24px 28px; max-width:560px; width:100%; }
+  #help h3 { margin:0 0 14px; font-size:15px; }
+  #help .grp { color:var(--accent); font-size:11px; text-transform:uppercase; letter-spacing:.6px; margin:14px 0 6px; }
+  #help table { width:100%; border-collapse:collapse; }
+  #help td { padding:4px 0; font-size:13px; color:var(--txt); vertical-align:top; }
+  #help td.k { width:130px; }
+  #help kbd { background:var(--panel2); border:1px solid var(--line); border-bottom-width:2px;
+              border-radius:6px; padding:1px 7px; font:12px ui-monospace,Menlo,monospace; color:#e6e9ef; }
+  #kbdHint { font-size:12px; color:var(--muted); cursor:pointer; padding:5px 9px; border:1px solid var(--line);
+             border-radius:7px; background:var(--panel); }
+  #kbdHint:hover { color:var(--txt); border-color:var(--accent); }
   .card.selected .selbox { background:var(--accent); border-color:var(--accent); color:#fff; }
   .card .date { font-size:10px; color:var(--muted); margin-top:4px; }
   /* bulk action bar */
@@ -410,6 +428,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="chips" id="sourceChips"></div>
   <div class="chips" id="catChips"></div>
   <button id="selectAllBtn" class="chip" onclick="selectAllShown()">☑ Select all</button>
+  <div id="kbdHint" onclick="toggleHelp()" title="Keyboard shortcuts (press ?)">⌨ shortcuts</div>
   <div id="sizeToggle" title="Thumbnail size">
     <button data-w="140">S</button><button data-w="190">M</button>
     <button data-w="240">L</button><button data-w="320">XL</button>
@@ -428,6 +447,33 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <button class="danger" onclick="bulkStatus('archived')">🗄 Archive</button>
   <input id="bulkAction" placeholder="Instruction to send to bot for all selected…">
   <button class="primary" id="bulkSendBtn" onclick="bulkSend()">Send →</button>
+</div>
+
+<div id="help" onclick="if(event.target.id==='help')toggleHelp(false)">
+  <div class="card2">
+    <h3>⌨ Keyboard shortcuts</h3>
+    <div class="grp">Grid</div>
+    <table>
+      <tr><td class="k"><kbd>j</kbd> <kbd>k</kbd> / <kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd></td><td>Move focus (white ring)</td></tr>
+      <tr><td class="k"><kbd>x</kbd> / <kbd>space</kbd></td><td>Select / deselect focused (auto-advances)</td></tr>
+      <tr><td class="k"><kbd>⌘A</kbd> / <kbd>ctrl A</kbd></td><td>Select all shown</td></tr>
+      <tr><td class="k"><kbd>a</kbd></td><td>Archive selection (or focused)</td></tr>
+      <tr><td class="k"><kbd>r</kbd></td><td>Mark reviewed</td></tr>
+      <tr><td class="k"><kbd>u</kbd></td><td>Back to needs-review</td></tr>
+      <tr><td class="k"><kbd>s</kbd></td><td>Send to bot — jumps to the instruction box (<kbd>Enter</kbd> sends)</td></tr>
+      <tr><td class="k"><kbd>o</kbd> / <kbd>Enter</kbd></td><td>Open focused</td></tr>
+      <tr><td class="k"><kbd>g</kbd> / <kbd>G</kbd></td><td>First / last</td></tr>
+      <tr><td class="k"><kbd>/</kbd></td><td>Search</td></tr>
+      <tr><td class="k"><kbd>Esc</kbd></td><td>Clear selection</td></tr>
+    </table>
+    <div class="grp">Open shot</div>
+    <table>
+      <tr><td class="k"><kbd>j</kbd> <kbd>k</kbd> / arrows</td><td>Next / previous shot</td></tr>
+      <tr><td class="k"><kbd>a</kbd> <kbd>r</kbd> <kbd>u</kbd></td><td>Set status</td></tr>
+      <tr><td class="k"><kbd>⌘Enter</kbd></td><td>Send to bot (from the instruction box)</td></tr>
+      <tr><td class="k"><kbd>Esc</kbd></td><td>Close</td></tr>
+    </table>
+  </div>
 </div>
 
 <div id="overlay">
@@ -472,6 +518,8 @@ let DATA = [], cur = null, QMSGS = [];
 // status filter defaults to the "Needs review" queue — that's the inbox.
 const state = { q:"", cats:new Set(), sources:new Set(), status:new Set(["needs_review"]) };
 const selected = new Set();  // uuids picked for bulk actions
+let shown = [];      // the currently-filtered items, in display order
+let focusIdx = 0;    // keyboard focus cursor into `shown`
 
 // Friendly source labels with an icon (DB stores "photos" / "desktop").
 const SOURCE_LABELS = { photos:"📱 iPhone", desktop:"🖥 Desktop" };
@@ -540,13 +588,17 @@ function match(d) {
 function render() {
   const g = document.getElementById('grid');
   const items = DATA.filter(match);
+  shown = items;
+  if (focusIdx > items.length-1) focusIdx = items.length-1;
+  if (focusIdx < 0) focusIdx = 0;
   document.getElementById('count').textContent = items.length + ' shown';
   g.innerHTML = '';
-  items.forEach(d => {
+  items.forEach((d, i) => {
     const st = d.status || 'needs_review';
     const card = document.createElement('div');
-    card.className='card st-'+st + (st==='archived'?' is-archived':'') + (selected.has(d.uuid)?' selected':'');
-    card.onclick=()=>openModal(d);
+    card.className='card st-'+st + (st==='archived'?' is-archived':'')
+      + (selected.has(d.uuid)?' selected':'') + (i===focusIdx?' focused':'');
+    card.onclick=()=>{ focusIdx=i; openModal(d); };
     const img = d.exists
       ? `<img loading="lazy" src="${imgUrl(d.uuid)}">`
       : `<div class="missing">image unavailable<br>${d.filename||''}</div>`;
@@ -591,7 +643,7 @@ async function bulkStatus(s){
 async function bulkSend(){
   const uuids = [...selected];
   const instruction = document.getElementById('bulkAction').value.trim();
-  if(!uuids.length) return;
+  if(!uuids.length){ document.getElementById('bulkAction').blur(); return; }
   if(!instruction){ document.getElementById('bulkAction').focus(); return; }
   const btn = document.getElementById('bulkSendBtn'); btn.disabled=true; btn.textContent='Sending…';
   const include = { meta:true, ocr:true, summary:true, image:false };
@@ -604,6 +656,41 @@ async function bulkSend(){
   btn.disabled=false; btn.textContent='Send →';
   selected.clear(); render(); updateBulkBar();
 }
+
+// ---- keyboard navigation ----
+function scrollFocusIntoView(){ const el=document.querySelector('.card.focused'); if(el) el.scrollIntoView({block:'nearest'}); }
+function moveFocus(delta){
+  if(!shown.length) return;
+  focusIdx = Math.max(0, Math.min(shown.length-1, focusIdx+delta));
+  render(); scrollFocusIntoView();
+}
+function toggleFocusSel(){
+  const d=shown[focusIdx]; if(!d) return;
+  selected.has(d.uuid)?selected.delete(d.uuid):selected.add(d.uuid);
+  if(focusIdx<shown.length-1) focusIdx++;     // auto-advance for fast runs
+  render(); updateBulkBar(); scrollFocusIntoView();
+}
+function openFocused(){ if(shown[focusIdx]) openModal(shown[focusIdx]); }
+// Status from the keyboard: act on the selection if any, else the focused card.
+async function kbStatus(s){
+  if(selected.size){ await bulkStatus(s); return; }
+  const d=shown[focusIdx]; if(!d) return;
+  await fetch('/api/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({uuids:[d.uuid], status:s})});
+  d.status=s; render(); scrollFocusIntoView();   // item may leave the filtered view; next slides in
+}
+function focusSendInput(){
+  if(!ACTION_ENABLED) return;
+  if(!selected.size && shown[focusIdx]) selected.add(shown[focusIdx].uuid);  // give send a target
+  render(); updateBulkBar();
+  const inp=document.getElementById('bulkAction'); inp.focus(); inp.select();
+}
+function modalStep(d){ moveFocus(d); if(shown[focusIdx]) openModal(shown[focusIdx]); }
+function toggleHelp(show){
+  const h=document.getElementById('help');
+  h.classList.toggle('on', show===undefined ? !h.classList.contains('on') : !!show);
+}
+function modalOpen(){ return document.getElementById('overlay').classList.contains('on'); }
 
 function openModal(d) {
   cur = d;
@@ -654,9 +741,55 @@ async function update(uuid, fields) {
 function flash(id){ const e=document.getElementById(id); e.classList.add('show'); setTimeout(()=>e.classList.remove('show'),1200); }
 function esc(s){ return (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
-document.getElementById('search').addEventListener('input', e=>{ state.q=e.target.value.toLowerCase().trim(); render(); });
-document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
+document.getElementById('search').addEventListener('input', e=>{ state.q=e.target.value.toLowerCase().trim(); focusIdx=0; render(); });
 document.getElementById('overlay').addEventListener('click', e=>{ if(e.target.id==='overlay') closeModal(); });
+
+document.addEventListener('keydown', e=>{
+  const t = e.target;
+  const typing = t && t.matches && t.matches('input,textarea,select');
+
+  // Escape always wins: close modal/help, else clear selection, else blur a field.
+  if(e.key==='Escape'){
+    if(document.getElementById('help').classList.contains('on')) return toggleHelp(false);
+    if(modalOpen()) return closeModal();
+    if(typing) return t.blur();
+    if(selected.size) return clearSel();
+    return;
+  }
+  // While typing, only handle the dedicated send shortcuts; let everything else through.
+  if(typing){
+    if(t.id==='bulkAction' && e.key==='Enter'){ e.preventDefault(); bulkSend(); }
+    else if(t.id==='mAction' && e.key==='Enter' && (e.metaKey||e.ctrlKey)){ e.preventDefault(); sendAction(); }
+    return;
+  }
+
+  if(e.key==='?'){ e.preventDefault(); return toggleHelp(); }
+  if(e.key==='/'){ e.preventDefault(); return document.getElementById('search').focus(); }
+  if((e.metaKey||e.ctrlKey) && (e.key==='a'||e.key==='A')){ e.preventDefault(); return selectAllShown(); }
+  if(e.metaKey||e.ctrlKey||e.altKey) return;  // don't shadow browser/OS combos
+
+  if(modalOpen()){
+    if(e.key==='j'||e.key==='ArrowDown'||e.key==='ArrowRight'){ e.preventDefault(); modalStep(1); }
+    else if(e.key==='k'||e.key==='ArrowUp'||e.key==='ArrowLeft'){ e.preventDefault(); modalStep(-1); }
+    else if(e.key==='a'){ saveStatus('archived'); }
+    else if(e.key==='r'){ saveStatus('reviewed'); }
+    else if(e.key==='u'){ saveStatus('needs_review'); }
+    return;
+  }
+
+  switch(e.key){
+    case 'j': case 'ArrowDown': case 'l': case 'ArrowRight': e.preventDefault(); moveFocus(1); break;
+    case 'k': case 'ArrowUp': case 'h': case 'ArrowLeft': e.preventDefault(); moveFocus(-1); break;
+    case 'x': case ' ': e.preventDefault(); toggleFocusSel(); break;
+    case 'o': case 'Enter': e.preventDefault(); openFocused(); break;
+    case 'a': kbStatus('archived'); break;
+    case 'r': kbStatus('reviewed'); break;
+    case 'u': kbStatus('needs_review'); break;
+    case 's': e.preventDefault(); focusSendInput(); break;
+    case 'g': focusIdx=0; moveFocus(0); break;
+    case 'G': focusIdx=shown.length-1; moveFocus(0); break;
+  }
+});
 
 const CATS = __CATS__;
 const STATUS_LABELS = __STATUS_LABELS__;
