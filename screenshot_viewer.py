@@ -58,7 +58,7 @@ import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 HOME = Path(os.environ.get("SCREENSHOT_DIGEST_HOME", str(Path.home() / ".screenshot-digest")))
 DB_PATH = HOME / "screenshots.db"
@@ -369,7 +369,7 @@ function render() {
     const card = document.createElement('div');
     card.className='card'; card.onclick=()=>openModal(d);
     const img = d.exists
-      ? `<img loading="lazy" src="/img/${d.uuid}">`
+      ? `<img loading="lazy" src="/img/${encodeURIComponent(d.uuid)}">`
       : `<div class="missing">image unavailable<br>${d.filename||''}</div>`;
     card.innerHTML = img + `<div class="meta">
         <p class="sum">${esc(d.summary||d.filename||'—')}</p>
@@ -381,9 +381,10 @@ function render() {
 
 function openModal(d) {
   cur = d;
-  document.getElementById('mImg').src = d.exists ? '/img/'+d.uuid+'?full=1' : '';
+  const uid = encodeURIComponent(d.uuid);
+  document.getElementById('mImg').src = d.exists ? '/img/'+uid+'?full=1' : '';
   const dl = document.getElementById('mDownload');
-  if (d.exists) { dl.style.display='inline-block'; dl.href='/img/'+d.uuid+'?full=1&download=1'; }
+  if (d.exists) { dl.style.display='inline-block'; dl.href='/img/'+uid+'?full=1&download=1'; }
   else { dl.style.display='none'; }
   document.getElementById('mFile').textContent = d.filename || d.uuid;
   document.getElementById('mDate').textContent =
@@ -500,7 +501,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/screenshots":
             return self._send(200, json.dumps(fetch_all()))
         if u.path.startswith("/img/"):
-            return self._serve_image(u.path[len("/img/"):], parse_qs(u.query))
+            # uuids can contain spaces/colons (e.g. "desktop:Screenshot ... .png"),
+            # so the browser percent-encodes them — decode before the DB lookup.
+            return self._serve_image(unquote(u.path[len("/img/"):]), parse_qs(u.query))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def _serve_image(self, uuid, qs):
