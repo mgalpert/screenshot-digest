@@ -417,6 +417,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .modal .info, .modal .ocr-pane { border-left:none; border-top:1px solid var(--line); }
     .modal .ocr-pane #mOcr { min-height:160px; }
   }
+  .mnav { display:flex; align-items:center; gap:10px; }
+  .mnav button { padding:5px 11px; border-radius:7px; border:1px solid var(--line);
+                 background:var(--panel2); color:var(--txt); cursor:pointer; font-size:12px; font-weight:500; }
+  .mnav button:hover { border-color:var(--accent); }
+  .mnav #mPos { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .mnav .advtoggle { margin-left:auto; display:flex; align-items:center; gap:5px;
+                     font-size:11.5px; color:var(--muted); cursor:pointer; }
+  .mnav .advtoggle input { accent-color:var(--accent); cursor:pointer; }
   .modal h2 { margin:0; font-size:15px; font-weight:600; letter-spacing:-.01em; }
   .modal .label { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin-bottom:7px; font-weight:600; }
   .modal .ocr { background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:12px;
@@ -531,6 +539,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="modal">
     <div class="img-pane"><img id="mImg" src=""></div>
     <div class="info">
+      <div class="mnav">
+        <button onclick="modalStep(-1)" title="Previous (k)">‹ Prev</button>
+        <span id="mPos"></span>
+        <button onclick="modalStep(1)" title="Next (j)">Next ›</button>
+        <label class="advtoggle" title="After a status change or send, jump to the next shot">
+          <input type="checkbox" id="autoAdv"> auto-advance</label>
+      </div>
       <div><h2 id="mFile"></h2><div class="small" id="mDate"></div>
         <a id="mDownload" class="dl" download>⬇ Download original</a></div>
       <div><div class="label">Summary</div><div id="mSum"></div></div>
@@ -736,6 +751,20 @@ function focusSendInput(){
   const inp=document.getElementById('bulkAction'); inp.focus(); inp.select();
 }
 function modalStep(d){ moveFocus(d); if(shown[focusIdx]) openModal(shown[focusIdx]); }
+// After acting on the open shot, move to the next one. If the shot dropped out of
+// the current filter (e.g. archived while viewing Needs review), the next item has
+// already shifted into its slot; otherwise step forward by one.
+let AUTO_ADV = localStorage.getItem('autoAdv') !== '0';   // default ON
+function advanceModal(){
+  if(!shown.length){ closeModal(); return; }
+  const acted = cur && cur.uuid;
+  if(shown[focusIdx] && shown[focusIdx].uuid===acted){
+    if(focusIdx < shown.length-1) focusIdx++; else { closeModal(); return; }
+  } else if(focusIdx > shown.length-1){
+    focusIdx = shown.length-1;
+  }
+  if(shown[focusIdx]){ openModal(shown[focusIdx]); scrollFocusIntoView(); } else closeModal();
+}
 function toggleHelp(show){
   const h=document.getElementById('help');
   h.classList.toggle('on', show===undefined ? !h.classList.contains('on') : !!show);
@@ -744,6 +773,9 @@ function modalOpen(){ return document.getElementById('overlay').classList.contai
 
 function openModal(d) {
   cur = d;
+  const idx = shown.indexOf(d); if(idx>=0) focusIdx = idx;   // keep nav/counter in sync
+  document.getElementById('mPos').textContent = shown.length ? ((focusIdx+1)+' / '+shown.length) : '';
+  document.getElementById('autoAdv').checked = AUTO_ADV;
   document.getElementById('mImg').src = d.exists ? imgUrl(d.uuid, {full:1}) : '';
   const dl = document.getElementById('mDownload');
   if (d.exists) { dl.style.display='inline-block'; dl.href=imgUrl(d.uuid, {full:1, download:1}); }
@@ -778,6 +810,7 @@ function renderStatusBtns() {
 async function saveStatus(s) {
   await update(cur.uuid, {status:s}); cur.status=s;
   renderStatusBtns(); flash('savedStatus'); render();
+  if(AUTO_ADV) advanceModal();
 }
 async function saveCat() {
   const v = document.getElementById('mCat').value;
@@ -907,8 +940,14 @@ async function sendAction() {
   if (r.ok) { flash('savedAction'); flash('savedOcr');
     cur.ocr_text = ocr; cur.status = 'reviewed'; renderStatusBtns(); render();  // sending counts as reviewing
     document.getElementById('actionNote').textContent=BOT_NAME+' is on it — marked reviewed, OCR saved. Watch your chat for the reply.';
+    if(AUTO_ADV) setTimeout(advanceModal, 700);   // brief pause so the confirmation is visible
   } else { document.getElementById('actionNote').textContent='⚠ '+(r.error||r.msg||'failed'); }
 }
+
+// ---- auto-advance toggle (persisted) ----
+document.getElementById('autoAdv').addEventListener('change', e=>{
+  AUTO_ADV = e.target.checked; localStorage.setItem('autoAdv', AUTO_ADV ? '1' : '0');
+});
 
 // ---- theme toggle (persisted; defaults to OS) ----
 function applyThemeGlyph(){
