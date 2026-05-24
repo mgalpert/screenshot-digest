@@ -63,6 +63,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 HOME = Path(os.environ.get("SCREENSHOT_DIGEST_HOME", str(Path.home() / ".screenshot-digest")))
 DB_PATH = HOME / "screenshots.db"
 ACTION_LOG = HOME / "viewer_actions.log"
+THUMB_CACHE = HOME / "thumb-cache"   # downscaled grid thumbnails, keyed by path+mtime+size
 
 # What to call the assistant in the UI.
 BOT_NAME = os.environ.get("SCREENSHOT_BOT_NAME", "your bot")
@@ -166,10 +167,14 @@ def save_quick_messages(msgs):
 
 
 def fetch_all():
+    # Note: full ocr_text is deliberately NOT shipped here — it's the heaviest
+    # column and a big library would balloon this payload. The grid only needs
+    # metadata + summary; full OCR loads lazily per shot via /api/ocr, and
+    # full-text search runs server-side via /api/search.
     conn = db()
     rows = conn.execute(
         "SELECT uuid, path, filename, date_taken, date_added, date_processed, "
-        "ocr_text, category, summary, source, "
+        "LENGTH(COALESCE(ocr_text,'')) AS ocr_len, category, summary, source, "
         "COALESCE(NULLIF(status,''), 'needs_review') AS status FROM screenshots "
         "ORDER BY COALESCE(date_taken, date_added) DESC"
     ).fetchall()
@@ -177,11 +182,28 @@ def fetch_all():
     out = []
     for r in rows:
         d = dict(r)
-        d["ocr_len"] = len(d.get("ocr_text") or "")
         d["exists"] = bool(d["path"] and os.path.exists(d["path"]))
         d["status"] = d.get("status") or "needs_review"
         out.append(d)
     return out
+
+
+def fetch_ocr(uuid):
+    conn = db()
+    row = conn.execute("SELECT ocr_text FROM screenshots WHERE uuid=?", (uuid,)).fetchone()
+    conn.close()
+    return (row["ocr_text"] or "") if row else ""
+
+
+def search_uuids(q):
+    """Server-side full-text search across OCR / summary / filename / category."""
+    like = f"%{q}%"
+    conn = db()
+    rows = conn.execute(
+        "SELECT uuid FROM screenshots WHERE ocr_text LIKE ? OR summary LIKE ? "
+        "OR filename LIKE ? OR category LIKE ?", (like, like, like, like)).fetchall()
+    conn.close()
+    return [r["uuid"] for r in rows]
 
 
 def _build_prompt(row, instruction, inc):
@@ -585,10 +607,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 let DATA = [], cur = null, QMSGS = [];
 // status filter defaults to the "Needs review" queue — that's the inbox.
-const state = { q:"", cats:new Set(), sources:new Set(), status:new Set(["needs_review"]) };
+const state = { q:"", cats:new Set(), sources:new Set(), status:new Set(["needs_review"]), qMatches:null };
 const selected = new Set();  // uuids picked for bulk actions
 let shown = [];      // the currently-filtered items, in display order
 let focusIdx = 0;    // keyboard focus cursor into `shown`
+let ocrReady = false;  // has the open shot's lazy-loaded OCR arrived?
 
 // Friendly source labels with an icon (DB stores "photos" / "desktop").
 const SOURCE_LABELS = { photos:"📱 iPhone", desktop:"🖥 Desktop" };
@@ -647,10 +670,8 @@ function match(d) {
   if (state.status.size && !state.status.has(d.status||'needs_review')) return false;
   if (state.sources.size && !state.sources.has(d.source)) return false;
   if (state.cats.size && !state.cats.has(d.category)) return false;
-  if (state.q) {
-    const hay = ((d.ocr_text||'')+' '+(d.summary||'')+' '+(d.filename||'')+' '+(d.category||'')).toLowerCase();
-    if (!hay.includes(state.q)) return false;
-  }
+  // Full-text search is resolved server-side (OCR isn't shipped to the grid).
+  if (state.q && !(state.qMatches && state.qMatches.has(d.uuid))) return false;
   return true;
 }
 
@@ -788,7 +809,18 @@ function openModal(d) {
   document.getElementById('mDate').textContent =
      (d.source||'') + (d.date_taken? ' · '+d.date_taken : '');
   document.getElementById('mSum').textContent = d.summary || '—';
-  document.getElementById('mOcr').value = d.ocr_text || '';
+  // OCR text isn't shipped with the grid payload — load it lazily for this shot.
+  // `ocrReady` guards Save/Send so a not-yet-loaded box can't overwrite real OCR.
+  const ocrEl = document.getElementById('mOcr');
+  if (typeof d.ocr_text === 'string') { ocrEl.value = d.ocr_text; ocrEl.placeholder='(no text)'; ocrReady = true; }
+  else {
+    ocrReady = false; ocrEl.value = ''; ocrEl.placeholder = 'Loading OCR…';
+    const reqUuid = d.uuid;
+    fetch('/api/ocr?id=' + encodeURIComponent(reqUuid)).then(r=>r.json()).then(j=>{
+      d.ocr_text = j.ocr_text || '';
+      if (cur && cur.uuid === reqUuid) { ocrEl.value = d.ocr_text; ocrEl.placeholder = '(no text)'; ocrReady = true; }
+    }).catch(()=>{ ocrEl.placeholder = '(failed to load OCR)'; });
+  }
   const sel = document.getElementById('mCat'); sel.innerHTML='';
   CATS.forEach(c => { const o=document.createElement('option'); o.value=c; o.textContent=c;
      if(c===d.category)o.selected=true; sel.appendChild(o); });
@@ -823,6 +855,7 @@ async function saveCat() {
 }
 // Persist edited OCR without sending — overrides the auto OCR with your cleanup.
 async function saveOcr() {
+  if (!ocrReady) return;   // don't overwrite real OCR before it has loaded
   const v = document.getElementById('mOcr').value;
   await update(cur.uuid, {ocr_text:v}); cur.ocr_text=v;
   flash('savedOcr');
@@ -834,7 +867,20 @@ async function update(uuid, fields) {
 function flash(id){ const e=document.getElementById(id); e.classList.add('show'); setTimeout(()=>e.classList.remove('show'),1200); }
 function esc(s){ return (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 
-document.getElementById('search').addEventListener('input', e=>{ state.q=e.target.value.toLowerCase().trim(); focusIdx=0; render(); });
+let _searchTimer = null;
+document.getElementById('search').addEventListener('input', e=>{
+  const q = e.target.value.trim();
+  state.q = q; focusIdx = 0;
+  clearTimeout(_searchTimer);
+  if (!q) { state.qMatches = null; render(); return; }
+  _searchTimer = setTimeout(async ()=>{
+    try {
+      const r = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json();
+      state.qMatches = new Set(r.uuids || []);
+    } catch { state.qMatches = new Set(); }
+    render();
+  }, 180);
+});
 document.getElementById('overlay').addEventListener('click', e=>{ if(e.target.id==='overlay') closeModal(); });
 
 document.addEventListener('keydown', e=>{
@@ -943,12 +989,15 @@ async function sendAction() {
     image: document.getElementById('incImage').checked,
   };
   // Send the (possibly edited) OCR — the server saves it back, cleaning the data.
-  const ocr = document.getElementById('mOcr').value;
+  // Only include it once the lazy OCR has loaded, so we never persist an empty box.
+  const payload = {uuid:cur.uuid, instruction, include};
+  if (ocrReady) payload.ocr = document.getElementById('mOcr').value;
   const r = await (await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({uuid:cur.uuid, instruction, include, ocr})})).json();
+    body: JSON.stringify(payload)})).json();
   btn.disabled=false; btn.textContent='Send to '+BOT_NAME+' →';
   if (r.ok) { flash('savedAction'); flash('savedOcr');
-    cur.ocr_text = ocr; cur.status = 'reviewed'; renderStatusBtns(); render();  // sending counts as reviewing
+    if (payload.ocr !== undefined) cur.ocr_text = payload.ocr;
+    cur.status = 'reviewed'; renderStatusBtns(); render();  // sending counts as reviewing
     document.getElementById('actionNote').textContent=BOT_NAME+' is on it — marked reviewed, OCR saved. Watch your chat for the reply.';
     if(AUTO_ADV) setTimeout(advanceModal, 700);   // brief pause so the confirmation is visible
   } else { document.getElementById('actionNote').textContent='⚠ '+(r.error||r.msg||'failed'); }
@@ -1012,6 +1061,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, html, "text/html; charset=utf-8")
         if u.path == "/api/screenshots":
             return self._send(200, json.dumps(fetch_all()))
+        if u.path == "/api/ocr":
+            uuid = (parse_qs(u.query).get("id") or [""])[0]
+            return self._send(200, json.dumps({"ocr_text": fetch_ocr(uuid)}))
+        if u.path == "/api/search":
+            q = (parse_qs(u.query).get("q") or [""])[0].strip()
+            uuids = search_uuids(q) if q else []
+            return self._send(200, json.dumps({"uuids": uuids}))
         if u.path == "/api/quickmsgs":
             return self._send(200, json.dumps({"messages": load_quick_messages()}))
         if u.path == "/img":
@@ -1045,15 +1101,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # Grid thumbnails (downscaled) keep big libraries snappy; the modal and
         # the download link ask for ?full=1 to get the file at native resolution.
+        # Generated thumbnails are cached to disk (keyed by path + mtime + size)
+        # so we encode each image once, not on every request.
         if not full and HAVE_PIL:
-            try:
-                im = Image.open(path)
-                im.thumbnail((900, 900))
-                buf = io.BytesIO()
-                im.convert("RGB").save(buf, "JPEG", quality=82)
-                return self._image_bytes(buf.getvalue(), "image/jpeg")
-            except Exception:
-                pass
+            data = self._thumb(path)
+            if data is not None:
+                return self._image_bytes(data, "image/jpeg")
         with open(path, "rb") as f:
             data = f.read()
         # Name the download after the original filename, but with the extension
@@ -1064,6 +1117,33 @@ class Handler(BaseHTTPRequestHandler):
         name = stem + ext
         disp = _content_disposition(name) if download else None
         self._image_bytes(data, ctype, disposition=disp)
+
+    def _thumb(self, path):
+        """Return downscaled JPEG bytes for `path`, caching to disk. None on failure.
+
+        Cache key is derived from the path + its mtime + size, so an edited file
+        re-thumbnails automatically and stale entries are never served.
+        """
+        try:
+            st = os.stat(path)
+            import hashlib
+            key = hashlib.sha1(f"{path}:{int(st.st_mtime)}:{st.st_size}".encode()).hexdigest()
+            cache_file = THUMB_CACHE / f"{key}.jpg"
+            if cache_file.exists():
+                return cache_file.read_bytes()
+            im = Image.open(path)
+            im.thumbnail((900, 900))
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, "JPEG", quality=82)
+            data = buf.getvalue()
+            try:
+                THUMB_CACHE.mkdir(parents=True, exist_ok=True)
+                cache_file.write_bytes(data)
+            except Exception:
+                pass   # cache is best-effort; still serve the bytes
+            return data
+        except Exception:
+            return None
 
     def _image_bytes(self, data, ctype, disposition=None):
         self.send_response(200)

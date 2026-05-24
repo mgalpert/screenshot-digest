@@ -83,13 +83,19 @@ def init_db(conn: sqlite3.Connection):
             category      TEXT,
             flag          TEXT,
             summary       TEXT,
-            source        TEXT DEFAULT 'photos'
+            source        TEXT DEFAULT 'photos',
+            -- Authoritative triage workflow state (owned by the viewer). `flag`
+            -- above is only the AI's advisory keep/review/delete recommendation.
+            status        TEXT DEFAULT 'needs_review'
         );
     """)
-    # Migrate older DBs that predate date_added
+    # Migrate older DBs that predate later columns.
     existing = [c[1] for c in conn.execute("PRAGMA table_info(screenshots)").fetchall()]
     if "date_added" not in existing:
         conn.execute("ALTER TABLE screenshots ADD COLUMN date_added TEXT")
+    if "status" not in existing:
+        conn.execute("ALTER TABLE screenshots ADD COLUMN status TEXT DEFAULT 'needs_review'")
+        conn.execute("UPDATE screenshots SET status='needs_review' WHERE status IS NULL OR status=''")
     conn.commit()
 
 
@@ -423,6 +429,12 @@ def process_screenshot(conn, item: dict, force: bool = False, local_only: bool =
         ocr_text = ocr_image(path)
         cat_data = rule_categorize(ocr_text, item["filename"])
 
+    # INSERT OR REPLACE deletes the old row, so any user triage (status) would be
+    # lost on a --all reprocess. Carry the existing status forward; new shots start
+    # at needs_review.
+    prev = conn.execute("SELECT status FROM screenshots WHERE uuid=?", (uuid,)).fetchone()
+    status = (prev[0] if prev and prev[0] else "needs_review")
+
     row = {
         "uuid": uuid,
         "path": path,
@@ -435,12 +447,13 @@ def process_screenshot(conn, item: dict, force: bool = False, local_only: bool =
         "flag": cat_data["flag"],
         "summary": cat_data["summary"],
         "source": item.get("source", "photos"),
+        "status": status,
     }
     conn.execute("""
         INSERT OR REPLACE INTO screenshots
-        (uuid,path,filename,date_taken,date_added,date_processed,ocr_text,category,flag,summary,source)
+        (uuid,path,filename,date_taken,date_added,date_processed,ocr_text,category,flag,summary,source,status)
         VALUES
-        (:uuid,:path,:filename,:date_taken,:date_added,:date_processed,:ocr_text,:category,:flag,:summary,:source)
+        (:uuid,:path,:filename,:date_taken,:date_added,:date_processed,:ocr_text,:category,:flag,:summary,:source,:status)
     """, row)
     conn.commit()
     return row
@@ -472,12 +485,21 @@ def build_digest(conn, days_back: int) -> str:
     n_del  = len(by_flag[FLAG_DELETE])
     n_rev  = len(by_flag[FLAG_REVIEW])
 
+    # Triage progress (the viewer's workflow axis) — distinct from the AI's
+    # keep/review/delete recommendation that we group by below.
+    n_needs = sum(1 for row in rows if (r(row).get("status") or "needs_review") == "needs_review")
+    n_done  = total - n_needs
+
     lines = [
         f"# Screenshot Digest — {datetime.now().strftime('%Y-%m-%d')}",
         "",
         f"> **{total}** screenshots · ✅ {n_keep} keep · 🗑️ {n_del} delete · 👁️ {n_rev} review",
+        f"> Triage: 🟠 {n_needs} need review · ✔️ {n_done} handled  "
+        f"_(grouping below is the AI's recommendation, not your triage state)_",
         "",
     ]
+
+    STATUS_MARK = {"reviewed": " ✔️ reviewed", "archived": " 🗄️ archived"}
 
     for flag, heading in [(FLAG_KEEP, "✅ Worth Keeping"), (FLAG_REVIEW, "👁️ Review These"), (FLAG_DELETE, "🗑️ Safe to Delete")]:
         group = by_flag[flag]
@@ -494,8 +516,9 @@ def build_digest(conn, days_back: int) -> str:
                 fname = d["filename"] or ""
                 summ  = d["summary"] or ""
                 path  = d["path"]
+                mark  = STATUS_MARK.get(d.get("status") or "needs_review", "")
                 lines += [
-                    f"- **{fname}** ({dt})  ",
+                    f"- **{fname}** ({dt}){mark}  ",
                     f"  {summ}  ",
                     f"  `{path}`",
                     "",

@@ -227,9 +227,11 @@ status_values: [needs_review, reviewed, archived]   # viewer triage lifecycle
 source_values: [photos, desktop]
 
 viewer_http_api:                      # localhost only
-  GET  /api/screenshots               # -> JSON array of all rows
+  GET  /api/screenshots               # -> rows WITHOUT full ocr_text (ships ocr_len)
+  GET  /api/ocr?id=<uuid>             # -> {ocr_text} for one shot (lazy-loaded)
+  GET  /api/search?q=<term>           # -> {uuids:[...]} full-text match, server-side
   GET  /api/quickmsgs                 # -> {messages: [...]}
-  GET  /img?id=<uuid>[&full=1][&download=1]
+  GET  /img?id=<uuid>[&full=1][&download=1]   # thumbnails disk-cached by path+mtime+size
   POST /api/update   {uuid, category?|status?|summary?|ocr_text?}
   POST /api/bulk     {uuids:[...], status}            # batch triage
   POST /api/action   {uuid, instruction, include{meta,ocr,summary,image}, ocr?}
@@ -242,8 +244,11 @@ action_env:                           # enables "send to bot" (off until set)
 ocr_env: GEMINI_OCR_KEY (optional), SCREENSHOT_GEMINI_MODEL
 notes:
   - re-runs are incremental (deduped by uuid); use --all to reprocess everything
+  - reprocessing PRESERVES each shot's triage `status` (only OCR/category/summary refresh)
+  - `flag` = AI's advisory keep/review/delete; `status` = authoritative triage state
   - uuids may contain spaces/colons/U+202F — always pass via ?id= (URL-encoded)
   - sending a shot to the bot, or POST /api/bulk, persists status server-side
+  - grid thumbnails are cached under $data_home/thumb-cache (safe to delete)
 ```
 
 ---
