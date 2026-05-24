@@ -1,171 +1,182 @@
 # 📸 screenshot-digest
 
-Turn your screenshot graveyard into a daily, searchable, auto-categorized review.
+Turn your screenshot graveyard into a searchable, auto-categorized, reviewable library.
 
 `screenshot-digest` finds your screenshots (macOS **Photos** library + **Desktop**),
-reads the text inside them (OCR), classifies each one, flags it **keep / review /
-delete**, and produces a clean daily markdown report — so you can actually decide
-what to act on and what to delete, instead of scrolling through thousands of images.
+reads the text inside them (OCR), classifies and summarizes each one, and stores it
+all in a local SQLite database. From there you get two ways to work through them:
 
-Everything runs locally except the optional Gemini call, and **no images are ever
-uploaded unless you enable the Gemini engine** (which sends the image to Google's
-API for OCR).
+- a **daily markdown digest** grouped by action and category, and
+- a **visual web viewer** — an inbox-style grid to filter, triage, and act on shots
+  (keyboard-driven, light/dark, multi-select), with optional "send to an AI assistant."
 
----
-
-## Why
-
-If you screenshot a lot, your library becomes a write-only memory hole. This tool
-makes it reviewable:
-
-- **OCR** every screenshot so its contents are searchable text.
-- **Categorize** into contacts, receipts, code, links, calendar events, articles,
-  conversations, maps, social, app UI, documents, etc.
-- **Flag** what's worth keeping vs. safe to delete.
-- **Daily digest** grouped by action and category.
+Everything runs locally except the optional Gemini OCR call. **No images leave your
+machine unless you enable the Gemini engine** (which sends the image to Google's API
+for OCR); the fully-local engine keeps everything on-device.
 
 ---
 
-## How it works
+## What actually happens
 
 ```
-DISCOVERY → OCR + CLASSIFY → CACHE (SQLite) → DAILY DIGEST (markdown)
- Photos +     Gemini Flash       dedupe by        grouped by
- Desktop      (or local OCR)     image uuid       keep/review/delete
+DISCOVERY ─────────► OCR + CLASSIFY ─────────► CACHE ─────────► REVIEW
+Photos library        Gemini Flash             SQLite           daily digest (md)
++ ~/Desktop           (or on-device OCR)        dedup by uuid    + visual viewer
 ```
 
-**Two engines:**
+1. **Discover** — enumerate screenshots from the Photos library and/or `~/Desktop`.
+2. **OCR + classify** — extract the text, write a one-line summary, assign a category
+   (receipt, code, contact, calendar event, article, social, map, …) and a keep/
+   review/delete flag.
+3. **Cache** — everything is stored in SQLite, deduped by image uuid, so re-runs are
+   cheap and incremental (only new screenshots get processed).
+4. **Review** — read the daily digest, or open the viewer to triage visually.
+
+---
+
+## What you need
+
+| Requirement | Notes |
+|-------------|-------|
+| **macOS** | Reads the Photos library via `osxphotos`; uses Apple Vision for local OCR. |
+| **Python 3.10+** | Standard CPython. |
+| **Photos / Full Disk access** | Grant your terminal access in System Settings → Privacy & Security, so it can read the Photos library. |
+| **Gemini API key** *(optional)* | For the best OCR. Without it, the tool falls back to fully-local OCR automatically. |
+| **Pillow** *(optional)* | Faster viewer thumbnails. Without it the viewer serves raw images. |
+| **Tesseract** *(optional)* | Extra local OCR fallback (`brew install tesseract`). |
+
+**OCR engines:**
 
 | Engine | OCR quality | Cost | Privacy |
 |--------|-------------|------|---------|
 | **Gemini Flash** (default) | Best — handles infographics, dark UI, dense tables | ~$0.0004/screenshot | Image sent to Google API |
 | **Local** (`--local`) | Good on plain text; weaker on complex images | Free | 100% on-device |
 
-In testing, Gemini decisively beat local OCR (Apple Vision / Tesseract) on visually
-complex screenshots where Tesseract failed outright and Vision garbled numbers. For
-plain-text screenshots they're equivalent. Use `--local` if you want zero data to
-leave your machine.
-
 > **iCloud note:** if your Photos use "Optimize Mac Storage," originals live in
-> iCloud. The tool automatically uses the locally-cached preview (plenty for OCR)
-> — no downloads required.
+> iCloud. The tool automatically uses the locally-cached preview (plenty for OCR) —
+> no downloads required.
 
 ---
 
-## Install
-
-Requires **macOS** and **Python 3.10+**.
+## Getting started
 
 ```bash
+# 1. Clone + install
 git clone https://github.com/mgalpert/screenshot-digest.git
 cd screenshot-digest
 pip install -r requirements.txt        # osxphotos + ocrmac
-brew install tesseract                 # optional local OCR fallback
+pip install pillow                     # optional: faster viewer thumbnails
+brew install tesseract                 # optional: extra local OCR fallback
+
+# 2. Grant Photos / Full Disk access to your terminal (System Settings → Privacy)
+
+# 3. (Optional) add a Gemini key for best OCR — otherwise it runs fully local
+export GEMINI_OCR_KEY=your_key_here    # or: echo 'GEMINI_OCR_KEY=...' > .env
+
+# 4. Import your BACKLOG once (the whole library + Desktop), then a report
+python3 screenshot_digest.py --all --desktop --report
+
+# 5. Browse + triage in the viewer
+python3 screenshot_viewer.py           # → http://127.0.0.1:8765
 ```
 
-Grant your terminal **Photos** (and/or **Full Disk**) access in
-System Settings → Privacy & Security so it can read the Photos library.
+After the one-time `--all` import, keep up with **new** screenshots by running the
+plain command (last-24h lookback) on a schedule — see [Automate](#automate). The
+viewer reads the same DB live, so new shots show up as soon as they're processed.
 
-### Gemini key (for the default engine)
-
-Get a key at https://aistudio.google.com/apikey, then either export it or drop a
-`.env` next to the script:
-
-```bash
-export GEMINI_OCR_KEY=your_key_here
-# or:  echo 'GEMINI_OCR_KEY=your_key_here' > .env
-```
-
-No key? It automatically falls back to local OCR (same as `--local`).
+> **Backlog vs. forward:** `--all` ingests your *entire* history; the default (no
+> `--all`) only looks back 1 day. So yes — you can process everything you already
+> have, not just screenshots taken from now on.
 
 ---
 
-## Usage
+## CLI reference (`screenshot_digest.py`)
 
 ```bash
-# Daily digest — new screenshots from the last 24h (Photos)
-python3 screenshot_digest.py --report
-
-# Include Desktop screenshots
-python3 screenshot_digest.py --desktop --report
-
-# Look back further
+python3 screenshot_digest.py --report                 # last 24h (Photos), write md report
+python3 screenshot_digest.py --desktop --report       # also include ~/Desktop screenshots
 python3 screenshot_digest.py --days 7 --desktop --report
-
-# Reprocess everything
-python3 screenshot_digest.py --all --desktop --report
-
-# Force fully-local (no API, nothing leaves your machine)
-python3 screenshot_digest.py --local --report
-
-# Inspect stored OCR text for a screenshot
-python3 screenshot_digest.py --show "receipt"
+python3 screenshot_digest.py --all --desktop --report # reprocess everything (the backlog)
+python3 screenshot_digest.py --local --report         # fully offline, nothing leaves the machine
+python3 screenshot_digest.py --show "receipt"         # dump stored OCR text matching a substring
 ```
 
 | Flag | Effect |
 |------|--------|
 | `--days N` | Lookback window in days (default 1) |
-| `--all` | Reprocess everything, ignore cache |
+| `--all` | Process the whole library/backlog, ignore the cache |
 | `--desktop` | Also scan `~/Desktop/Screenshot*.png` |
 | `--report` | Write a markdown report instead of printing |
 | `--local` | Force offline (Apple Vision OCR + rules), skip Gemini |
 | `--show SUBSTR` | Dump stored OCR text for filenames matching SUBSTR |
 
-Output goes to `~/.screenshot-digest/` by default (DB + reports). Override with
-`SCREENSHOT_DIGEST_HOME`. Pick the model with `SCREENSHOT_GEMINI_MODEL`
-(default `gemini-3.5-flash`).
+**Environment:**
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `SCREENSHOT_DIGEST_HOME` | `~/.screenshot-digest` | Where the DB + reports live |
+| `GEMINI_OCR_KEY` | — | Gemini API key (falls back to local if unset) |
+| `SCREENSHOT_GEMINI_MODEL` | `gemini-3.5-flash` | Which Gemini model to use |
 
 ---
 
-## Automate (daily report)
+## Visual viewer (`screenshot_viewer.py`)
 
-Run it nightly with `cron`:
-
-```cron
-5 20 * * *  /usr/bin/python3 /path/to/screenshot_digest.py --desktop --report
-```
-
----
-
-## Visual viewer (browse · filter · recategorize · act)
-
-The digest is great for a daily glance, but sometimes you want to *see* your
-screenshots. `screenshot_viewer.py` is a self-contained localhost web app
-(Python stdlib only) that reads the same SQLite DB:
+A self-contained localhost web app (Python **stdlib only**) that reads the same DB.
+It's built for working *through* a backlog like an inbox.
 
 ```bash
 python3 screenshot_viewer.py            # → http://127.0.0.1:8765
 python3 screenshot_viewer.py --port 9000
 ```
 
-- **Visual grid** of every screenshot (thumbnails served straight from disk).
+- **Visual grid** with thumbnails, a **size toggle** (S/M/L/XL), and **light/dark
+  mode** (follows your OS, with a manual toggle that's remembered).
 - **Live text filter** across OCR text, summary, filename, and category.
-- **Filter chips** for category and triage status.
-- **Triage lifecycle.** Every shot is in one of three states — **Needs review →
-  Reviewed → Archived**. New shots land in *Needs review* (badged in the grid),
-  and the view defaults to that queue so it works like an inbox. Acting on a shot
-  — sending it to the bot, or picking a status in the modal — moves it along;
-  *Archived* is the gentle "done with this" state (dimmed, not deleted).
-- **Click any shot** for the full image + **editable OCR text** and inline
-  **recategorize / restatus** — changes save straight back to the DB. Editing the
-  OCR and hitting send overwrites the stored text, so you clean up the data as
-  you go.
+- **Filter chips** for triage status, **category**, and **source** (📱 iPhone /
+  🖥 Desktop). Each card shows its source badge and capture date.
+- **Triage lifecycle.** Every shot is **Needs review → Reviewed → Archived**. New
+  shots land in *Needs review* and the view opens to that queue (an inbox). Acting on
+  a shot — sending it to the bot, or setting a status — moves it along; *Archived* is
+  the gentle "done" state (dimmed, not deleted).
+- **Multi-select + bulk actions.** Pick many shots (checkbox, **Select all**, or the
+  keyboard), then archive / mark reviewed / send them to the bot in one go.
+- **Click any shot** for the full-resolution image, a **download original** link, an
+  **editable OCR text** box, and inline recategorize / restatus — all saved straight
+  to the DB. Editing OCR then sending overwrites the stored text, so you clean up data
+  as you triage.
 
-> Thumbnails are snappier if you have Pillow (`pip install pillow`); without it
-> the viewer just serves the raw images.
+> Thumbnails are snappier with Pillow (`pip install pillow`); without it the viewer
+> serves the raw images.
+
+### Keyboard shortcuts (mouse-free triage)
+
+Press **`?`** in the viewer for the in-app cheatsheet. Actions apply to your
+selection if you have one, otherwise the focused card.
+
+| Context | Keys | Action |
+|---------|------|--------|
+| Grid | `j` `k` / arrows | Move focus cursor |
+| Grid | `x` / `space` | Select / deselect (auto-advances) |
+| Grid | `⌘A` / `ctrl A` | Select all shown |
+| Grid | `a` · `r` · `u` | Archive · Reviewed · back to Needs-review |
+| Grid | `s` | Jump to the send box (`Enter` sends to bot) |
+| Grid | `o` / `Enter` | Open focused · `g`/`G` first/last · `/` search |
+| Open shot | `j` `k` / arrows | Next / previous shot |
+| Open shot | `a` `r` `u` · `⌘Enter` | Set status · send to bot |
+| Anywhere | `Esc` | Clear selection / close |
 
 ### "Send to bot" actions (optional, off by default)
 
-Each screenshot can be handed to an AI assistant with a free-text instruction —
-*"add this event to my calendar,"* *"find ticket prices,"* *"draft a reply."*
-You choose, via checkboxes, exactly what to send (metadata / OCR text / summary
-/ the image itself). The image is the only part that costs vision tokens, so
-it's **off by default** — the cheap text usually has everything.
+Hand a screenshot to an AI assistant with a free-text instruction — *"add this event
+to my calendar,"* *"find ticket prices,"* *"draft a reply."* Checkboxes pick exactly
+what to send (metadata / OCR text / summary / the image). The image is the only part
+that costs vision tokens, so it's **off by default** — the text is usually enough.
 
 Wire it to any assistant two ways:
 
 ```bash
-# A) Any CLI/script — prompt is piped on stdin, or replaces {prompt}
+# A) Any CLI/script — the prompt is piped on stdin, or replaces {prompt}
 export SCREENSHOT_BOT_NAME="my assistant"
 export SCREENSHOT_ACTION_CMD='my-cli chat --stdin'
 
@@ -174,14 +185,68 @@ export SCREENSHOT_ACTION_CMD='my-cli chat --stdin'
 export SCREENSHOT_BOT_NAME="Pal"
 export SCREENSHOT_ACTION_TARGET="<your chat id>"
 export SCREENSHOT_ACTION_CHANNEL="telegram"   # default
+export SCREENSHOT_ACTION_AGENT="main"         # default
 ```
 
 The action panel stays hidden until one of these is configured.
 
 **Quick messages.** Instead of hardcoded prompts, the panel shows *your* reusable
-instructions. Type one and hit **+ save current as quick message**; it's stored
-in `quick_messages.json` next to the DB and shown as a one-click chip on every
-shot (the `×` removes it). Starts empty — it fills with whatever you actually use.
+instructions. Type one and hit **+ save current as quick message**; it's stored in
+`quick_messages.json` next to the DB and shown as a one-click chip on every shot (the
+`×` removes it). Starts empty — it fills with whatever you actually use.
+
+---
+
+## Automate
+
+Import the backlog once, then keep up nightly with `cron`:
+
+```cron
+# every night at 20:05 — process new screenshots from the last day
+5 20 * * *  /usr/bin/python3 /path/to/screenshot_digest.py --desktop --report
+```
+
+---
+
+## For AI agents / automation
+
+A compact, machine-readable summary so an agent can drive this without reading prose.
+
+```yaml
+platform: macOS, Python 3.10+
+entrypoints:
+  ingest: python3 screenshot_digest.py [--all|--days N] [--desktop] [--local] [--report]
+  viewer: python3 screenshot_viewer.py [--port 8765] [--host 127.0.0.1]
+data_home: $SCREENSHOT_DIGEST_HOME (default ~/.screenshot-digest)
+database: $data_home/screenshots.db   # SQLite, table: screenshots
+quick_messages: $data_home/quick_messages.json   # JSON array of reusable instructions
+action_log: $data_home/viewer_actions.log
+
+db_columns: [uuid, path, filename, date_taken, date_added, date_processed,
+             ocr_text, category, summary, source, flag, status]
+             # (a legacy `reviewed` int column may also exist on older DBs)
+status_values: [needs_review, reviewed, archived]   # viewer triage lifecycle
+source_values: [photos, desktop]
+
+viewer_http_api:                      # localhost only
+  GET  /api/screenshots               # -> JSON array of all rows
+  GET  /api/quickmsgs                 # -> {messages: [...]}
+  GET  /img?id=<uuid>[&full=1][&download=1]
+  POST /api/update   {uuid, category?|status?|summary?|ocr_text?}
+  POST /api/bulk     {uuids:[...], status}            # batch triage
+  POST /api/action   {uuid, instruction, include{meta,ocr,summary,image}, ocr?}
+  POST /api/quickmsgs {text} | {op:"delete", text}
+
+action_env:                           # enables "send to bot" (off until set)
+  generic: SCREENSHOT_ACTION_CMD='cli --stdin'   # prompt on stdin, or {prompt} token
+  openclaw: SCREENSHOT_ACTION_TARGET, SCREENSHOT_ACTION_CHANNEL, SCREENSHOT_ACTION_AGENT
+  label: SCREENSHOT_BOT_NAME
+ocr_env: GEMINI_OCR_KEY (optional), SCREENSHOT_GEMINI_MODEL
+notes:
+  - re-runs are incremental (deduped by uuid); use --all to reprocess everything
+  - uuids may contain spaces/colons/U+202F — always pass via ?id= (URL-encoded)
+  - sending a shot to the bot, or POST /api/bulk, persists status server-side
+```
 
 ---
 
@@ -194,7 +259,7 @@ sqlite3 ~/.screenshot-digest/screenshots.db \
   "SELECT filename, summary FROM screenshots WHERE category='receipt_financial';"
 ```
 
-> ⚠️ **Privacy heads-up:** the DB stores OCR'd text in cleartext — that means any
+> ⚠️ **Privacy heads-up:** the DB stores OCR'd text in cleartext — meaning any
 > passwords, 2FA codes, or private info visible in your screenshots end up in a
 > searchable local file. Keep it on an encrypted disk and mind who has access.
 
