@@ -300,10 +300,42 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .dot { width:7px; height:7px; border-radius:50%; display:inline-block; }
   .dot.needs_review{background:var(--review)} .dot.reviewed{background:var(--keep)} .dot.archived{background:var(--muted)}
   .card.is-archived { opacity:.55; }
+  /* status shows as a tinted left border for fast scanning */
+  .card.st-needs_review { border-left:3px solid var(--review); }
+  .card.st-reviewed { border-left:3px solid var(--keep); }
+  .card.st-archived { border-left:3px solid var(--muted); }
   .status-badge { position:absolute; top:8px; left:8px; z-index:2; font-size:10px; font-weight:600;
                   padding:3px 8px; border-radius:999px; box-shadow:0 1px 6px rgba(0,0,0,.4); }
   .status-badge.needs_review { background:var(--review); color:#1a1a1a; }
   .status-badge.archived { background:var(--muted); color:#0d0f14; }
+  /* source badge (iPhone / Desktop) — top-right twin of the status badge */
+  .src-badge { position:absolute; top:8px; right:8px; z-index:2; font-size:10px; font-weight:600;
+               padding:3px 8px; border-radius:999px; background:rgba(13,15,20,.85);
+               color:var(--txt); box-shadow:0 1px 6px rgba(0,0,0,.4); }
+  /* selection checkbox — sits under the status badge, click-to-select */
+  .selbox { position:absolute; bottom:8px; right:8px; z-index:3; width:24px; height:24px;
+            border-radius:7px; border:2px solid rgba(255,255,255,.6); background:rgba(13,15,20,.7);
+            display:flex; align-items:center; justify-content:center; cursor:pointer;
+            color:transparent; font-size:14px; font-weight:800; transition:.1s; }
+  .selbox:hover { border-color:var(--accent); }
+  .card.selected { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent); }
+  .card.selected .selbox { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .card .date { font-size:10px; color:var(--muted); margin-top:4px; }
+  /* bulk action bar */
+  #bulkbar { position:fixed; bottom:0; left:0; right:0; z-index:40; transform:translateY(120%);
+             transition:.18s; background:rgba(22,25,34,.97); backdrop-filter:blur(12px);
+             border-top:1px solid var(--line); padding:12px 20px; display:flex; gap:10px;
+             align-items:center; flex-wrap:wrap; box-shadow:0 -4px 24px rgba(0,0,0,.4); }
+  #bulkbar.on { transform:translateY(0); }
+  #bulkbar .selcount { font-weight:650; }
+  #bulkbar button { padding:8px 14px; border-radius:8px; border:1px solid var(--line);
+                    background:var(--panel2); color:var(--txt); cursor:pointer; font-size:13px; }
+  #bulkbar button:hover { border-color:var(--accent); }
+  #bulkbar button.danger:hover { border-color:var(--delete); color:var(--delete); }
+  #bulkbar button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #bulkbar input { background:var(--bg); border:1px solid var(--line); color:var(--txt);
+                   padding:8px 12px; border-radius:8px; font-size:13px; min-width:240px; flex:1; }
+  #bulkbar .spacer { flex:1; }
   .missing { padding:30px 10px; text-align:center; color:var(--muted); font-size:11px; background:var(--panel2); }
   /* modal */
   #overlay { position:fixed; inset:0; background:rgba(0,0,0,.8); z-index:50; display:none;
@@ -376,6 +408,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </header>
 <main id="grid"></main>
 
+<div id="bulkbar">
+  <span class="selcount" id="selCount">0 selected</span>
+  <button onclick="clearSel()">Clear</button>
+  <button onclick="selectAllShown()">Select all shown</button>
+  <span class="spacer"></span>
+  <button onclick="bulkStatus('needs_review')">↺ Needs review</button>
+  <button onclick="bulkStatus('reviewed')">✓ Reviewed</button>
+  <button class="danger" onclick="bulkStatus('archived')">🗄 Archive</button>
+  <input id="bulkAction" placeholder="Instruction to send to bot for all selected…">
+  <button class="primary" id="bulkSendBtn" onclick="bulkSend()">Send →</button>
+</div>
+
 <div id="overlay">
   <div class="close" onclick="closeModal()">×</div>
   <div class="modal">
@@ -417,6 +461,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
 let DATA = [], cur = null, QMSGS = [];
 // status filter defaults to the "Needs review" queue — that's the inbox.
 const state = { q:"", cats:new Set(), status:new Set(["needs_review"]) };
+const selected = new Set();  // uuids picked for bulk actions
+
+// Friendly source labels with an icon (DB stores "photos" / "desktop").
+const SOURCE_LABELS = { photos:"📱 iPhone", desktop:"🖥 Desktop" };
+function srcLabel(s){ return SOURCE_LABELS[s] || (s? ('· '+s) : ''); }
+function fmtDate(iso){
+  if(!iso) return '';
+  const d = new Date(iso); if(isNaN(d)) return iso;
+  return d.toLocaleString(undefined,{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});
+}
 
 // The ONE place image URLs are built. uuids can contain spaces, colons, and
 // U+202F (macOS screenshot names) — URLSearchParams encodes all of it safely,
@@ -432,6 +486,7 @@ async function load() {
   await loadQmsgs();
   buildChips();
   render();
+  updateBulkBar();
 }
 
 function buildChips() {
@@ -471,18 +526,64 @@ function render() {
   items.forEach(d => {
     const st = d.status || 'needs_review';
     const card = document.createElement('div');
-    card.className='card' + (st==='archived'?' is-archived':''); card.onclick=()=>openModal(d);
+    card.className='card st-'+st + (st==='archived'?' is-archived':'') + (selected.has(d.uuid)?' selected':'');
+    card.onclick=()=>openModal(d);
     const img = d.exists
       ? `<img loading="lazy" src="${imgUrl(d.uuid)}">`
       : `<div class="missing">image unavailable<br>${d.filename||''}</div>`;
     const badge = (st==='needs_review') ? '<div class="status-badge needs_review">needs review</div>'
                 : (st==='archived') ? '<div class="status-badge archived">archived</div>' : '';
-    card.innerHTML = badge + img + `<div class="meta">
+    const src = d.source ? `<div class="src-badge">${srcLabel(d.source)}</div>` : '';
+    card.innerHTML = badge + src + img +
+      `<div class="selbox" title="Select">✓</div>` +
+      `<div class="meta">
         <p class="sum">${esc(d.summary||d.filename||'—')}</p>
         <div class="tags"><span class="dot ${st}"></span>
-          <span class="tag">${d.category||'—'}</span></div></div>`;
+          <span class="tag">${d.category||'—'}</span>
+          <span class="tag">${srcLabel(d.source)}</span></div>
+        <div class="date">${fmtDate(d.date_taken||d.date_added)}</div></div>`;
+    card.querySelector('.selbox').onclick = (e)=>{ e.stopPropagation(); toggleSel(d.uuid); };
     g.appendChild(card);
   });
+}
+
+// ---- multi-select + bulk actions ----
+function toggleSel(uuid){
+  selected.has(uuid) ? selected.delete(uuid) : selected.add(uuid);
+  render(); updateBulkBar();
+}
+function clearSel(){ selected.clear(); render(); updateBulkBar(); }
+function selectAllShown(){ DATA.filter(match).forEach(d=>selected.add(d.uuid)); render(); updateBulkBar(); }
+function updateBulkBar(){
+  const bar = document.getElementById('bulkbar');
+  document.getElementById('selCount').textContent = selected.size + ' selected';
+  bar.classList.toggle('on', selected.size>0);
+  document.getElementById('bulkSendBtn').style.display = ACTION_ENABLED ? '' : 'none';
+  document.getElementById('bulkAction').style.display = ACTION_ENABLED ? '' : 'none';
+}
+async function bulkStatus(s){
+  const uuids = [...selected];
+  if(!uuids.length) return;
+  await fetch('/api/bulk', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({uuids, status:s})});
+  DATA.forEach(d=>{ if(selected.has(d.uuid)) d.status=s; });
+  selected.clear(); render(); updateBulkBar();
+}
+async function bulkSend(){
+  const uuids = [...selected];
+  const instruction = document.getElementById('bulkAction').value.trim();
+  if(!uuids.length) return;
+  if(!instruction){ document.getElementById('bulkAction').focus(); return; }
+  const btn = document.getElementById('bulkSendBtn'); btn.disabled=true; btn.textContent='Sending…';
+  const include = { meta:true, ocr:true, summary:true, image:false };
+  for(const uuid of uuids){
+    await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({uuid, instruction, include})});
+  }
+  DATA.forEach(d=>{ if(selected.has(d.uuid)) d.status='reviewed'; });
+  document.getElementById('bulkAction').value='';
+  btn.disabled=false; btn.textContent='Send →';
+  selected.clear(); render(); updateBulkBar();
 }
 
 function openModal(d) {
@@ -702,10 +803,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
-        if u.path not in ("/api/update", "/api/action", "/api/quickmsgs"):
+        if u.path not in ("/api/update", "/api/action", "/api/quickmsgs", "/api/bulk"):
             return self._send(404, json.dumps({"error": "not found"}))
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or "{}")
+
+        # Bulk status update for multi-select (archive / reviewed / needs_review).
+        if u.path == "/api/bulk":
+            uuids = body.get("uuids") or []
+            status = body.get("status")
+            if not uuids or status not in STATUSES:
+                return self._send(400, json.dumps({"error": "uuids and a valid status required"}))
+            conn = db()
+            conn.executemany("UPDATE screenshots SET status=? WHERE uuid=?",
+                             [(status, u_) for u_ in uuids])
+            conn.commit()
+            conn.close()
+            return self._send(200, json.dumps({"ok": True, "updated": len(uuids), "status": status}))
 
         # Quick-message list management (no uuid needed).
         if u.path == "/api/quickmsgs":
