@@ -1,0 +1,7 @@
+# Core (macOS, Python 3.10+)
+osxphotos>=0.68    # read the Photos library + screenshot flag + cached derivatives
+ocrmac>=1.0        # Apple Vision OCR (local fallback engine)
+
+# Optional: tesseract is used as a last-resort OCR fallback.
+#   brew install tesseract
+# Gemini (default engine) needs no package — it's a plain HTTPS call via stdlib.
