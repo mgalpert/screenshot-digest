@@ -407,7 +407,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <h1>📸 Screenshots <span id="total"></span></h1>
   <input id="search" placeholder="Filter by text, summary, filename…" autocomplete="off">
   <div class="chips" id="statusChips"></div>
+  <div class="chips" id="sourceChips"></div>
   <div class="chips" id="catChips"></div>
+  <button id="selectAllBtn" class="chip" onclick="selectAllShown()">☑ Select all</button>
   <div id="sizeToggle" title="Thumbnail size">
     <button data-w="140">S</button><button data-w="190">M</button>
     <button data-w="240">L</button><button data-w="320">XL</button>
@@ -468,7 +470,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 let DATA = [], cur = null, QMSGS = [];
 // status filter defaults to the "Needs review" queue — that's the inbox.
-const state = { q:"", cats:new Set(), status:new Set(["needs_review"]) };
+const state = { q:"", cats:new Set(), sources:new Set(), status:new Set(["needs_review"]) };
 const selected = new Set();  // uuids picked for bulk actions
 
 // Friendly source labels with an icon (DB stores "photos" / "desktop").
@@ -506,6 +508,14 @@ function buildChips() {
     el.onclick=()=>{ state.status.has(s)?state.status.delete(s):state.status.add(s); el.classList.toggle('on'); render(); };
     sc.appendChild(el);
   });
+  const srcs = [...new Set(DATA.map(d=>d.source).filter(Boolean))].sort();
+  const srcBox = document.getElementById('sourceChips');
+  srcs.forEach(s => {
+    const el = document.createElement('div');
+    el.className='chip'; el.textContent=srcLabel(s);
+    el.onclick=()=>{ state.sources.has(s)?state.sources.delete(s):state.sources.add(s); el.classList.toggle('on'); render(); };
+    srcBox.appendChild(el);
+  });
   const cats = [...new Set(DATA.map(d=>d.category).filter(Boolean))].sort();
   const cc = document.getElementById('catChips');
   cats.forEach(c => {
@@ -518,6 +528,7 @@ function buildChips() {
 
 function match(d) {
   if (state.status.size && !state.status.has(d.status||'needs_review')) return false;
+  if (state.sources.size && !state.sources.has(d.source)) return false;
   if (state.cats.size && !state.cats.has(d.category)) return false;
   if (state.q) {
     const hay = ((d.ocr_text||'')+' '+(d.summary||'')+' '+(d.filename||'')+' '+(d.category||'')).toLowerCase();
