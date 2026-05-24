@@ -402,11 +402,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
              align-items:center; justify-content:center; padding:30px; }
   #overlay.on { display:flex; }
   .modal { background:var(--panel); border:1px solid var(--line); border-radius:16px;
-           max-width:1100px; width:100%; max-height:90vh; display:flex; overflow:hidden; box-shadow:var(--shadow-lg); }
-  .modal .img-pane { flex:1.2; background:var(--img-bg); display:flex; align-items:center; justify-content:center;
+           max-width:1340px; width:100%; max-height:90vh; display:flex; overflow:hidden; box-shadow:var(--shadow-lg); }
+  .modal .img-pane { flex:1.1; background:var(--img-bg); display:flex; align-items:center; justify-content:center;
                      overflow:auto; min-width:0; }
   .modal .img-pane img { max-width:100%; max-height:90vh; object-fit:contain; }
-  .modal .info { flex:1; padding:24px; overflow-y:auto; display:flex; flex-direction:column; gap:18px; min-width:330px; }
+  .modal .info { flex:1; padding:24px; overflow-y:auto; display:flex; flex-direction:column; gap:18px;
+                 min-width:320px; border-left:1px solid var(--line); }
+  /* third panel: OCR gets its own full-height column so nothing has to scroll past it */
+  .modal .ocr-pane { flex:1; padding:24px; display:flex; flex-direction:column; gap:8px;
+                     min-width:300px; border-left:1px solid var(--line); }
+  .modal .ocr-pane #mOcr { flex:1; min-height:0; max-height:none; }
+  @media (max-width:980px) {
+    .modal { flex-direction:column; max-height:92vh; overflow-y:auto; }
+    .modal .info, .modal .ocr-pane { border-left:none; border-top:1px solid var(--line); }
+    .modal .ocr-pane #mOcr { min-height:160px; }
+  }
   .modal h2 { margin:0; font-size:15px; font-weight:600; letter-spacing:-.01em; }
   .modal .label { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin-bottom:7px; font-weight:600; }
   .modal .ocr { background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:12px;
@@ -545,10 +555,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button id="sendBtn" onclick="sendAction()">Send →</button>
         <div class="small" id="actionNote"></div>
       </div>
-      <div>
-        <div class="label">OCR text <span class="small">(editable — saved on send)</span> <span class="saved" id="savedOcr">saved ✓</span></div>
-        <textarea id="mOcr" placeholder="(no text)"></textarea>
-      </div>
+    </div>
+    <div class="ocr-pane">
+      <div class="label">OCR text <span class="small">(editable — saved on send)</span> <span class="saved" id="savedOcr">saved ✓</span></div>
+      <textarea id="mOcr" placeholder="(no text)"></textarea>
     </div>
   </div>
 </div>
