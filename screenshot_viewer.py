@@ -257,6 +257,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .saved { color:var(--keep); font-size:11px; opacity:0; transition:.2s; }
   .saved.show{opacity:1}
   .small { color:var(--muted); font-size:11px; }
+  .dl { display:inline-block; margin-top:6px; font-size:12px; color:var(--accent);
+        text-decoration:none; cursor:pointer; }
+  .dl:hover { text-decoration:underline; }
   #actionBox { background:var(--bg); border:1px solid var(--line); border-radius:12px; padding:14px; }
   .incl { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:10px; font-size:12px; color:var(--muted); }
   .incl label { display:flex; align-items:center; gap:5px; cursor:pointer; }
@@ -289,7 +292,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="modal">
     <div class="img-pane"><img id="mImg" src=""></div>
     <div class="info">
-      <div><h2 id="mFile"></h2><div class="small" id="mDate"></div></div>
+      <div><h2 id="mFile"></h2><div class="small" id="mDate"></div>
+        <a id="mDownload" class="dl" download>⬇ Download original</a></div>
       <div><div class="label">Summary</div><div id="mSum"></div></div>
       <div>
         <div class="label">Category <span class="saved" id="savedCat">saved ✓</span></div>
@@ -377,7 +381,10 @@ function render() {
 
 function openModal(d) {
   cur = d;
-  document.getElementById('mImg').src = d.exists ? '/img/'+d.uuid : '';
+  document.getElementById('mImg').src = d.exists ? '/img/'+d.uuid+'?full=1' : '';
+  const dl = document.getElementById('mDownload');
+  if (d.exists) { dl.style.display='inline-block'; dl.href='/img/'+d.uuid+'?full=1&download=1'; }
+  else { dl.style.display='none'; }
   document.getElementById('mFile').textContent = d.filename || d.uuid;
   document.getElementById('mDate').textContent =
      (d.source||'') + (d.date_taken? ' · '+d.date_taken : '');
@@ -498,33 +505,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_image(self, uuid, qs):
         conn = db()
-        row = conn.execute("SELECT path FROM screenshots WHERE uuid=?", (uuid,)).fetchone()
+        row = conn.execute(
+            "SELECT path, filename FROM screenshots WHERE uuid=?", (uuid,)).fetchone()
         conn.close()
         if not row or not row["path"] or not os.path.exists(row["path"]):
             return self._send(404, b"", "image/png")
         path = row["path"]
-        # Thumbnail via Pillow when available (keeps the grid snappy on big libraries).
-        if HAVE_PIL:
+        full = "full" in qs          # native resolution (modal / download)
+        download = "download" in qs  # force a file download
+        ext = os.path.splitext(path)[1].lower()
+        ctype = "image/png" if ext == ".png" else "image/jpeg"
+
+        # Grid thumbnails (downscaled) keep big libraries snappy; the modal and
+        # the download link ask for ?full=1 to get the file at native resolution.
+        if not full and HAVE_PIL:
             try:
                 im = Image.open(path)
                 im.thumbnail((900, 900))
                 buf = io.BytesIO()
                 im.convert("RGB").save(buf, "JPEG", quality=82)
-                data = buf.getvalue()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Cache-Control", "max-age=86400")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                return self.wfile.write(data)
+                return self._image_bytes(buf.getvalue(), "image/jpeg")
             except Exception:
                 pass
         with open(path, "rb") as f:
             data = f.read()
-        ctype = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+        # Name the download after the original filename, but with the extension
+        # of the file we actually have on disk — for iCloud "optimized" Photos
+        # that's a cached JPEG derivative, not the original PNG, so don't lie
+        # about the type.
+        stem = os.path.splitext(row["filename"] or uuid)[0]
+        name = stem + ext
+        disp = f'attachment; filename="{name}"' if download else None
+        self._image_bytes(data, ctype, disposition=disp)
+
+    def _image_bytes(self, data, ctype, disposition=None):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "max-age=86400")
+        if disposition:
+            self.send_header("Content-Disposition", disposition)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
