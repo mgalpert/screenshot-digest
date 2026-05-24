@@ -287,7 +287,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .chip.st-reviewed.on{background:var(--keep);border-color:var(--keep);color:#08130d}
   .chip.st-archived.on{background:var(--muted);border-color:var(--muted);color:#0d0f14}
   #count { color:var(--muted); font-size:12px; margin-left:auto; }
-  main { padding:18px; columns: 5 220px; column-gap:14px; }
+  main { padding:18px; columns: var(--col, 220px); column-gap:14px; }
+  #sizeToggle { display:flex; gap:4px; }
+  #sizeToggle button { padding:5px 9px; border-radius:7px; border:1px solid var(--line);
+                       background:var(--panel); color:var(--muted); cursor:pointer; font-size:12px; }
+  #sizeToggle button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
   .card { break-inside:avoid; margin:0 0 14px; background:var(--panel); border:1px solid var(--line);
           border-radius:12px; overflow:hidden; cursor:pointer; transition:.15s; position:relative; }
   .card:hover { border-color:var(--accent); transform:translateY(-2px); }
@@ -404,6 +408,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <input id="search" placeholder="Filter by text, summary, filename…" autocomplete="off">
   <div class="chips" id="statusChips"></div>
   <div class="chips" id="catChips"></div>
+  <div id="sizeToggle" title="Thumbnail size">
+    <button data-w="140">S</button><button data-w="190">M</button>
+    <button data-w="240">L</button><button data-w="320">XL</button>
+  </div>
   <div id="count"></div>
 </header>
 <main id="grid"></main>
@@ -707,6 +715,15 @@ async function sendAction() {
     document.getElementById('actionNote').textContent=BOT_NAME+' is on it — marked reviewed, OCR saved. Watch your chat for the reply.';
   } else { document.getElementById('actionNote').textContent='⚠ '+(r.error||r.msg||'failed'); }
 }
+
+// ---- thumbnail size toggle (persisted) ----
+function setSize(w){
+  document.documentElement.style.setProperty('--col', w+'px');
+  localStorage.setItem('shotColW', w);
+  document.querySelectorAll('#sizeToggle button').forEach(b=>b.classList.toggle('on', b.dataset.w===String(w)));
+}
+document.querySelectorAll('#sizeToggle button').forEach(b=> b.onclick=()=>setSize(b.dataset.w));
+setSize(localStorage.getItem('shotColW') || '190');
 
 load();
 </script>
