@@ -16,11 +16,11 @@ Usage:
   screenshot_digest.py --local      # force offline (Apple Vision + rules), no API
   screenshot_digest.py --show TEXT  # show full OCR text for a filename substring
 
-Setup: see README.md. Requires Python 3.10+, osxphotos, ocrmac (or tesseract),
+Setup: see README.md. Requires Python 3.10+, osxphotos, ocrmac,
 and a Gemini API key in GEMINI_OCR_KEY (or GEMINI_API_KEY).
 """
 
-import argparse, json, os, re, sqlite3, subprocess, sys, textwrap
+import argparse, json, os, re, sqlite3, sys, textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -157,25 +157,13 @@ def get_desktop_screenshots(days_back: int) -> list[dict]:
 # ── OCR ─────────────────────────────────────────────────────────────────────
 
 def ocr_image(path: str) -> str:
-    """OCR an image using Apple Vision (ocrmac) with tesseract fallback."""
-    # Try Apple Vision first
+    """OCR an image locally using Apple Vision (ocrmac)."""
     try:
         from ocrmac.ocrmac import OCR
         items = OCR(path, language_preference=["en-US"]).recognize()
         if items:
             return "\n".join(item[0] for item in items if item[0].strip())
-    except Exception:
-        pass
-
-    # Tesseract fallback
-    try:
-        out = subprocess.check_output(
-            ["tesseract", path, "stdout", "--psm", "3", "-l", "eng"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=30,
-        )
-        return out.strip()
+        return ""
     except Exception as e:
         print(f"[warn] OCR failed for {Path(path).name}: {e}", file=sys.stderr)
         return ""

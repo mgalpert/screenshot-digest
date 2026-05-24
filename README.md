@@ -42,15 +42,14 @@ Photos library        Gemini Flash             SQLite           daily digest (md
 | **Python 3.10+** | Standard CPython. |
 | **Photos / Full Disk access** | Grant your terminal access in System Settings → Privacy & Security, so it can read the Photos library. |
 | **Gemini API key** *(optional)* | For the best OCR. Without it, the tool falls back to fully-local OCR automatically. |
-| **Pillow** *(optional)* | Faster viewer thumbnails. Without it the viewer serves raw images. |
-| **Tesseract** *(optional)* | Extra local OCR fallback (`brew install tesseract`). |
+| **Pillow** *(optional)* | Faster viewer thumbnails — downscales images to ~900px JPEGs for the grid. Without it the viewer serves the raw full-size files. Viewer-only; not used for OCR. |
 
 **OCR engines:**
 
 | Engine | OCR quality | Cost | Privacy |
 |--------|-------------|------|---------|
 | **Gemini Flash** (default) | Best — handles infographics, dark UI, dense tables | ~$0.0004/screenshot | Image sent to Google API |
-| **Local** (`--local`) | Good on plain text; weaker on complex images | Free | 100% on-device |
+| **Local** (`--local`) | Apple Vision (`ocrmac`); good on plain text, weaker on complex images | Free | 100% on-device |
 
 > **iCloud note:** if your Photos use "Optimize Mac Storage," originals live in
 > iCloud. The tool automatically uses the locally-cached preview (plenty for OCR) —
@@ -64,9 +63,8 @@ Photos library        Gemini Flash             SQLite           daily digest (md
 # 1. Clone + install
 git clone https://github.com/mgalpert/screenshot-digest.git
 cd screenshot-digest
-pip install -r requirements.txt        # osxphotos + ocrmac
+pip install -r requirements.txt        # osxphotos + ocrmac (Apple Vision OCR)
 pip install pillow                     # optional: faster viewer thumbnails
-brew install tesseract                 # optional: extra local OCR fallback
 
 # 2. Grant Photos / Full Disk access to your terminal (System Settings → Privacy)
 

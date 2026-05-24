@@ -1,10 +1,10 @@
 # Core (macOS, Python 3.10+)
 osxphotos>=0.68    # read the Photos library + screenshot flag + cached derivatives
-ocrmac>=1.0        # Apple Vision OCR (local fallback engine)
+ocrmac>=1.0        # Apple Vision OCR (the local engine)
 
-# Optional: tesseract is used as a last-resort OCR fallback.
-#   brew install tesseract
-# Gemini (default engine) needs no package — it's a plain HTTPS call via stdlib.
+# Gemini (default OCR engine) needs no package — it's a plain HTTPS call via stdlib.
 
 # Optional: faster thumbnails in the visual viewer (screenshot_viewer.py).
-# pillow>=10        # without it, the viewer serves raw images instead
+# Pillow downscales images to ~900px JPEGs for the grid; without it the viewer
+# serves the raw full-size files instead.
+# pillow>=10
