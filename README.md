@@ -127,6 +127,52 @@ Run it nightly with `cron`:
 
 ---
 
+## Visual viewer (browse · filter · recategorize · act)
+
+The digest is great for a daily glance, but sometimes you want to *see* your
+screenshots. `screenshot_viewer.py` is a self-contained localhost web app
+(Python stdlib only) that reads the same SQLite DB:
+
+```bash
+python3 screenshot_viewer.py            # → http://127.0.0.1:8765
+python3 screenshot_viewer.py --port 9000
+```
+
+- **Visual grid** of every screenshot (thumbnails served straight from disk).
+- **Live text filter** across OCR text, summary, filename, and category.
+- **Filter chips** for category and keep/review/delete flag.
+- **Click any shot** for the full image + full OCR text, and **recategorize /
+  re-flag inline** — changes save straight back to the DB.
+
+> Thumbnails are snappier if you have Pillow (`pip install pillow`); without it
+> the viewer just serves the raw images.
+
+### "Send to bot" actions (optional, off by default)
+
+Each screenshot can be handed to an AI assistant with a free-text instruction —
+*"add this event to my calendar,"* *"find ticket prices,"* *"draft a reply."*
+You choose, via checkboxes, exactly what to send (metadata / OCR text / summary
+/ the image itself). The image is the only part that costs vision tokens, so
+it's **off by default** — the cheap text usually has everything.
+
+Wire it to any assistant two ways:
+
+```bash
+# A) Any CLI/script — prompt is piped on stdin, or replaces {prompt}
+export SCREENSHOT_BOT_NAME="my assistant"
+export SCREENSHOT_ACTION_CMD='my-cli chat --stdin'
+
+# B) OpenClaw (https://openclaw.ai) — runs a real agent turn with tools
+#    (calendar, web, email) and delivers the reply to a chat channel
+export SCREENSHOT_BOT_NAME="Pal"
+export SCREENSHOT_ACTION_TARGET="<your chat id>"
+export SCREENSHOT_ACTION_CHANNEL="telegram"   # default
+```
+
+The action panel stays hidden until one of these is configured.
+
+---
+
 ## The data is yours
 
 Results live in a plain SQLite DB you can query:
