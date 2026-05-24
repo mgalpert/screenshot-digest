@@ -412,6 +412,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .modal .ocr-pane { flex:1; padding:24px; display:flex; flex-direction:column; gap:8px;
                      min-width:300px; border-left:1px solid var(--line); }
   .modal .ocr-pane #mOcr { flex:1; min-height:0; max-height:none; }
+  #saveOcrBtn { align-self:flex-start; padding:7px 14px; border-radius:8px; border:1px solid var(--line);
+                background:var(--panel2); color:var(--txt); cursor:pointer; font-size:12.5px; font-weight:500; transition:.12s; }
+  #saveOcrBtn:hover { border-color:var(--accent); }
   @media (max-width:980px) {
     .modal { flex-direction:column; max-height:92vh; overflow-y:auto; }
     .modal .info, .modal .ocr-pane { border-left:none; border-top:1px solid var(--line); }
@@ -572,8 +575,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="ocr-pane">
-      <div class="label">OCR text <span class="small">(editable — saved on send)</span> <span class="saved" id="savedOcr">saved ✓</span></div>
+      <div class="label">OCR text <span class="small">(editable)</span> <span class="saved" id="savedOcr">saved ✓</span></div>
       <textarea id="mOcr" placeholder="(no text)"></textarea>
+      <button id="saveOcrBtn" onclick="saveOcr()">Save OCR</button>
     </div>
   </div>
 </div>
@@ -816,6 +820,12 @@ async function saveCat() {
   const v = document.getElementById('mCat').value;
   await update(cur.uuid, {category:v}); cur.category=v;
   flash('savedCat'); render();
+}
+// Persist edited OCR without sending — overrides the auto OCR with your cleanup.
+async function saveOcr() {
+  const v = document.getElementById('mOcr').value;
+  await update(cur.uuid, {ocr_text:v}); cur.ocr_text=v;
+  flash('savedOcr');
 }
 async function update(uuid, fields) {
   await fetch('/api/update', {method:'POST', headers:{'Content-Type':'application/json'},
