@@ -141,6 +141,10 @@ python3 screenshot_viewer.py --port 9000
 - **Visual grid** of every screenshot (thumbnails served straight from disk).
 - **Live text filter** across OCR text, summary, filename, and category.
 - **Filter chips** for category and keep/review/delete flag.
+- **Review queue.** Every shot starts as **Needs review** (badged in the grid);
+  the view defaults to that queue so it works like an inbox. Acting on a shot —
+  sending it to the bot, or toggling **Reviewed** in the modal — clears it from
+  the queue. Filter by *Needs review* / *Reviewed* anytime.
 - **Click any shot** for the full image + full OCR text, and **recategorize /
   re-flag inline** — changes save straight back to the DB.
 

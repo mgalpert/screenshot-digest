@@ -115,11 +115,28 @@ def db():
     return conn
 
 
+def ensure_schema():
+    """Auto-migrate: add the `reviewed` triage column if it's missing.
+
+    `reviewed` is a 0/1 triage state separate from `flag` (keep/review/delete):
+    everything lands as 0 (Needs review) and flips to 1 (Reviewed) once you've
+    acted on it — most often by sending it to the bot. Idempotent, so it's safe
+    to run on every startup and keeps the public-repo schema in sync.
+    """
+    conn = db()
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(screenshots)")}
+    if "reviewed" not in cols:
+        conn.execute("ALTER TABLE screenshots ADD COLUMN reviewed INTEGER DEFAULT 0")
+        conn.commit()
+    conn.close()
+
+
 def fetch_all():
     conn = db()
     rows = conn.execute(
         "SELECT uuid, path, filename, date_taken, date_added, date_processed, "
-        "ocr_text, category, flag, summary, source FROM screenshots "
+        "ocr_text, category, flag, summary, source, "
+        "COALESCE(reviewed, 0) AS reviewed FROM screenshots "
         "ORDER BY COALESCE(date_taken, date_added) DESC"
     ).fetchall()
     conn.close()
@@ -128,6 +145,7 @@ def fetch_all():
         d = dict(r)
         d["ocr_len"] = len(d.get("ocr_text") or "")
         d["exists"] = bool(d["path"] and os.path.exists(d["path"]))
+        d["reviewed"] = int(d.get("reviewed") or 0)
         out.append(d)
     return out
 
@@ -229,6 +247,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .chip.flag-keep.on{background:var(--keep);border-color:var(--keep)}
   .chip.flag-review.on{background:var(--review);border-color:var(--review);color:#1a1a1a}
   .chip.flag-delete.on{background:var(--delete);border-color:var(--delete)}
+  .chip.rev-needs.on{background:var(--review);border-color:var(--review);color:#1a1a1a}
+  .chip.rev-done.on{background:var(--keep);border-color:var(--keep);color:#08130d}
   #count { color:var(--muted); font-size:12px; margin-left:auto; }
   main { padding:18px; columns: 5 220px; column-gap:14px; }
   .card { break-inside:avoid; margin:0 0 14px; background:var(--panel); border:1px solid var(--line);
@@ -242,6 +262,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
          color:var(--muted); }
   .dot { width:7px; height:7px; border-radius:50%; display:inline-block; }
   .dot.keep{background:var(--keep)} .dot.review{background:var(--review)} .dot.delete{background:var(--delete)}
+  .needs-badge { position:absolute; top:8px; left:8px; z-index:2; font-size:10px; font-weight:600;
+                 padding:3px 8px; border-radius:999px; background:var(--review); color:#1a1a1a;
+                 box-shadow:0 1px 6px rgba(0,0,0,.4); }
   .missing { padding:30px 10px; text-align:center; color:var(--muted); font-size:11px; background:var(--panel2); }
   /* modal */
   #overlay { position:fixed; inset:0; background:rgba(0,0,0,.8); z-index:50; display:none;
@@ -296,6 +319,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <header>
   <h1>📸 Screenshots <span id="total"></span></h1>
   <input id="search" placeholder="Filter by text, summary, filename…" autocomplete="off">
+  <div class="chips" id="reviewChips"></div>
   <div class="chips" id="catChips"></div>
   <div class="chips" id="flagChips"></div>
   <div id="count"></div>
@@ -318,6 +342,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div class="label">Flag <span class="saved" id="savedFlag">saved ✓</span></div>
         <div class="flagbtns" id="mFlags"></div>
       </div>
+      <div>
+        <div class="label">Review <span class="saved" id="savedReview">saved ✓</span></div>
+        <div class="flagbtns"><button id="mReview" onclick="toggleReview()"></button></div>
+      </div>
       <div id="actionBox">
         <div class="label">⚡ Send to <span id="botLabel"></span> <span class="saved" id="savedAction">on it ✓</span></div>
         <div class="incl" id="incl">
@@ -338,7 +366,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
 <script>
 let DATA = [], cur = null;
-const state = { q:"", cats:new Set(), flags:new Set() };
+// review filter defaults to the "Needs review" queue — that's the inbox.
+const state = { q:"", cats:new Set(), flags:new Set(), review:new Set(["needs"]) };
 
 // The ONE place image URLs are built. uuids can contain spaces, colons, and
 // U+202F (macOS screenshot names) — URLSearchParams encodes all of it safely,
@@ -356,6 +385,14 @@ async function load() {
 }
 
 function buildChips() {
+  const rc = document.getElementById('reviewChips');
+  [['needs','● Needs review'],['done','✓ Reviewed']].forEach(([v,label]) => {
+    const el = document.createElement('div');
+    el.className = 'chip rev-'+v + (state.review.has(v)?' on':'');
+    el.textContent = label;
+    el.onclick=()=>{ state.review.has(v)?state.review.delete(v):state.review.add(v); el.classList.toggle('on'); render(); };
+    rc.appendChild(el);
+  });
   const cats = [...new Set(DATA.map(d=>d.category).filter(Boolean))].sort();
   const cc = document.getElementById('catChips');
   cats.forEach(c => {
@@ -374,6 +411,10 @@ function buildChips() {
 }
 
 function match(d) {
+  if (state.review.size) {
+    const key = d.reviewed ? 'done' : 'needs';
+    if (!state.review.has(key)) return false;
+  }
   if (state.cats.size && !state.cats.has(d.category)) return false;
   if (state.flags.size && !state.flags.has(d.flag)) return false;
   if (state.q) {
@@ -394,7 +435,8 @@ function render() {
     const img = d.exists
       ? `<img loading="lazy" src="${imgUrl(d.uuid)}">`
       : `<div class="missing">image unavailable<br>${d.filename||''}</div>`;
-    card.innerHTML = img + `<div class="meta">
+    const badge = d.reviewed ? '' : '<div class="needs-badge">needs review</div>';
+    card.innerHTML = badge + img + `<div class="meta">
         <p class="sum">${esc(d.summary||d.filename||'—')}</p>
         <div class="tags"><span class="dot ${d.flag}"></span>
           <span class="tag">${d.category||'—'}</span></div></div>`;
@@ -424,11 +466,22 @@ function openModal(d) {
     const b=document.createElement('button'); b.textContent=f; b.className=f+(f===d.flag?' on':'');
     b.onclick=()=>saveFlag(f); fb.appendChild(b);
   });
+  renderReviewBtn();
   setupAction(d);
   document.getElementById('overlay').classList.add('on');
 }
 function closeModal(){ document.getElementById('overlay').classList.remove('on'); }
 
+function renderReviewBtn() {
+  const b = document.getElementById('mReview');
+  if (cur.reviewed) { b.textContent='✓ Reviewed — mark needs review'; b.className='keep on'; }
+  else { b.textContent='● Needs review — mark reviewed'; b.className='review on'; }
+}
+async function toggleReview() {
+  const next = cur.reviewed ? 0 : 1;
+  await update(cur.uuid, {reviewed: next}); cur.reviewed = next;
+  renderReviewBtn(); flash('savedReview'); render();
+}
 async function saveCat() {
   const v = document.getElementById('mCat').value;
   await update(cur.uuid, {category:v}); cur.category=v;
@@ -489,7 +542,8 @@ async function sendAction() {
     body: JSON.stringify({uuid:cur.uuid, instruction, include})})).json();
   btn.disabled=false; btn.textContent='Send to '+BOT_NAME+' →';
   if (r.ok) { flash('savedAction');
-    document.getElementById('actionNote').textContent=BOT_NAME+' is on it — watch your chat for the reply.';
+    cur.reviewed = 1; renderReviewBtn(); render();  // sending counts as reviewing
+    document.getElementById('actionNote').textContent=BOT_NAME+' is on it — marked reviewed. Watch your chat for the reply.';
   } else { document.getElementById('actionNote').textContent='⚠ '+(r.error||r.msg||'failed'); }
 }
 
@@ -601,13 +655,19 @@ class Handler(BaseHTTPRequestHandler):
             if not instruction:
                 return self._send(400, json.dumps({"error": "instruction required"}))
             ok, msg = dispatch_action(uuid, instruction, body.get("include"))
-            return self._send(200, json.dumps({"ok": ok, "msg": msg}))
+            if ok:
+                # Acting on a shot counts as reviewing it — clear it from the queue.
+                conn = db()
+                conn.execute("UPDATE screenshots SET reviewed=1 WHERE uuid=?", (uuid,))
+                conn.commit()
+                conn.close()
+            return self._send(200, json.dumps({"ok": ok, "msg": msg, "reviewed": ok}))
 
         sets, vals = [], []
-        for col in ("category", "flag", "summary"):
+        for col in ("category", "flag", "summary", "reviewed"):
             if col in body:
                 sets.append(f"{col}=?")
-                vals.append(body[col])
+                vals.append(int(body[col]) if col == "reviewed" else body[col])
         if not sets:
             return self._send(400, json.dumps({"error": "nothing to update"}))
         vals.append(uuid)
@@ -626,6 +686,7 @@ def main():
     if not DB_PATH.exists():
         sys.exit(f"DB not found at {DB_PATH} (run screenshot_digest.py first, "
                  f"or set SCREENSHOT_DIGEST_HOME)")
+    ensure_schema()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}"
     print(f"[viewer] {DB_PATH}")
