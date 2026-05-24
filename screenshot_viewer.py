@@ -94,6 +94,21 @@ except Exception:
     HAVE_PIL = False
 
 
+def _content_disposition(filename):
+    """Build a Content-Disposition header safe for ANY filename.
+
+    HTTP headers must be Latin-1, but macOS screenshot names contain U+202F
+    (narrow no-break space) and other non-Latin-1 chars. So we emit an ASCII
+    fallback `filename=` plus an RFC 5987 `filename*=UTF-8''…` that modern
+    browsers prefer — covering the full original name without crashing the
+    header encoder.
+    """
+    from urllib.parse import quote
+    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace('"', "")
+    return (f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(filename)}")
+
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -325,6 +340,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
 let DATA = [], cur = null;
 const state = { q:"", cats:new Set(), flags:new Set() };
 
+// The ONE place image URLs are built. uuids can contain spaces, colons, and
+// U+202F (macOS screenshot names) — URLSearchParams encodes all of it safely,
+// so don't hand-build /img URLs anywhere else.
+function imgUrl(uuid, opts={}) {
+  const p = new URLSearchParams({ id: uuid, ...opts });
+  return '/img?' + p.toString();
+}
+
 async function load() {
   DATA = await (await fetch('/api/screenshots')).json();
   document.getElementById('total').textContent = '· ' + DATA.length;
@@ -369,7 +392,7 @@ function render() {
     const card = document.createElement('div');
     card.className='card'; card.onclick=()=>openModal(d);
     const img = d.exists
-      ? `<img loading="lazy" src="/img/${encodeURIComponent(d.uuid)}">`
+      ? `<img loading="lazy" src="${imgUrl(d.uuid)}">`
       : `<div class="missing">image unavailable<br>${d.filename||''}</div>`;
     card.innerHTML = img + `<div class="meta">
         <p class="sum">${esc(d.summary||d.filename||'—')}</p>
@@ -381,10 +404,9 @@ function render() {
 
 function openModal(d) {
   cur = d;
-  const uid = encodeURIComponent(d.uuid);
-  document.getElementById('mImg').src = d.exists ? '/img/'+uid+'?full=1' : '';
+  document.getElementById('mImg').src = d.exists ? imgUrl(d.uuid, {full:1}) : '';
   const dl = document.getElementById('mDownload');
-  if (d.exists) { dl.style.display='inline-block'; dl.href='/img/'+uid+'?full=1&download=1'; }
+  if (d.exists) { dl.style.display='inline-block'; dl.href=imgUrl(d.uuid, {full:1, download:1}); }
   else { dl.style.display='none'; }
   document.getElementById('mFile').textContent = d.filename || d.uuid;
   document.getElementById('mDate').textContent =
@@ -500,9 +522,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, html, "text/html; charset=utf-8")
         if u.path == "/api/screenshots":
             return self._send(200, json.dumps(fetch_all()))
+        if u.path == "/img":
+            # uuid travels as a query param (?id=), NOT a path segment: desktop
+            # uuids are "desktop:<filename>" and macOS screenshot names contain a
+            # colon and a narrow no-break space (U+202F). parse_qs decodes the
+            # percent-encoding for us, so there's no manual unquote to forget and
+            # no path-splitting to trip over. Client must encodeURIComponent the id.
+            qs = parse_qs(u.query)
+            uuid = (qs.get("id") or [""])[0]
+            if not uuid:
+                return self._send(400, json.dumps({"error": "missing id"}))
+            return self._serve_image(uuid, qs)
+        # Back-compat: older /img/<uuid> path form (still decode defensively).
         if u.path.startswith("/img/"):
-            # uuids can contain spaces/colons (e.g. "desktop:Screenshot ... .png"),
-            # so the browser percent-encodes them — decode before the DB lookup.
             return self._serve_image(unquote(u.path[len("/img/"):]), parse_qs(u.query))
         return self._send(404, json.dumps({"error": "not found"}))
 
@@ -538,7 +570,7 @@ class Handler(BaseHTTPRequestHandler):
         # about the type.
         stem = os.path.splitext(row["filename"] or uuid)[0]
         name = stem + ext
-        disp = f'attachment; filename="{name}"' if download else None
+        disp = _content_disposition(name) if download else None
         self._image_bytes(data, ctype, disposition=disp)
 
     def _image_bytes(self, data, ctype, disposition=None):
