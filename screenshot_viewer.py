@@ -97,6 +97,15 @@ STATUS_LABELS = {"needs_review": "Needs review", "reviewed": "Reviewed", "archiv
 # it's editable and portable; NOT hardcoded in the UI.
 QMSG_PATH = HOME / "quick_messages.json"
 
+# Semantic / hybrid search. Embeddings (text-embedding-3-small, 1536d) live in a
+# sqlite-vec `vec_shots` table inside the SAME DB, built by screenshot_embed.py.
+# When they're present + an OpenAI key is set, /api/search fuses keyword and
+# vector results with Reciprocal Rank Fusion; otherwise it degrades to the
+# original keyword-only search, so the viewer works with or without embeddings.
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
+RRF_K = 60          # RRF damping (same constant gbrain uses): score = Σ 1/(K+rank)
+VEC_TOPK = 200      # vector candidates pulled per query before fusion
+
 # Optional Pillow for fast thumbnails; falls back to serving the raw file.
 try:
     from PIL import Image
@@ -167,19 +176,18 @@ def save_quick_messages(msgs):
     return clean
 
 
-def fetch_all():
-    # Note: full ocr_text is deliberately NOT shipped here — it's the heaviest
-    # column and a big library would balloon this payload. The grid only needs
-    # metadata + summary; full OCR loads lazily per shot via /api/ocr, and
-    # full-text search runs server-side via /api/search.
-    conn = db()
-    rows = conn.execute(
-        "SELECT uuid, path, filename, date_taken, date_added, date_processed, "
-        "LENGTH(COALESCE(ocr_text,'')) AS ocr_len, category, summary, source, "
-        "COALESCE(NULLIF(status,''), 'needs_review') AS status FROM screenshots "
-        "ORDER BY COALESCE(date_taken, date_added) DESC"
-    ).fetchall()
-    conn.close()
+# The grid is server-windowed: at 48k shots, shipping the whole library to the
+# browser (and rendering it) is the performance wall. So the grid only ever
+# pulls a bounded slice — by default the last 7 days that still need review —
+# and re-queries when you change filters. Full ocr_text is never shipped here
+# (heaviest column); it loads lazily per shot via /api/ocr.
+_GRID_COLS = ("SELECT uuid, path, filename, date_taken, date_added, date_processed, "
+              "LENGTH(COALESCE(ocr_text,'')) AS ocr_len, category, summary, source, "
+              "COALESCE(NULLIF(status,''), 'needs_review') AS status FROM screenshots")
+GRID_LIMIT = 1500   # safety cap for a wide window (e.g. all-time, one status)
+
+
+def _hydrate(rows):
     out = []
     for r in rows:
         d = dict(r)
@@ -189,6 +197,50 @@ def fetch_all():
     return out
 
 
+def fetch_all(statuses=None, date_from=None, date_to=None, limit=GRID_LIMIT):
+    conn = db()
+    where, params = [], []
+    if statuses:
+        where.append("COALESCE(NULLIF(status,''),'needs_review') IN (%s)"
+                     % ",".join("?" * len(statuses)))
+        params += list(statuses)
+    # Compare on the YYYY-MM-DD prefix so timezone suffixes in the stored ISO
+    # timestamps can't skew the range filter.
+    if date_from:
+        where.append("substr(COALESCE(date_taken,date_added),1,10) >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("substr(COALESCE(date_taken,date_added),1,10) <= ?")
+        params.append(date_to)
+    sql = _GRID_COLS + ((" WHERE " + " AND ".join(where)) if where else "")
+    sql += " ORDER BY COALESCE(date_taken, date_added) DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return _hydrate(rows)
+
+
+def fetch_rows_by_uuids(uuids):
+    """Grid rows for a specific set of uuids, returned in the SAME order as the
+    input (so /api/search can return relevance-ranked rows the grid renders
+    directly — independent of whatever date/status window is loaded)."""
+    if not uuids:
+        return []
+    conn = db()
+    rows = conn.execute(_GRID_COLS + " WHERE uuid IN (%s)" % ",".join("?" * len(uuids)),
+                        uuids).fetchall()
+    conn.close()
+    by = {d["uuid"]: d for d in _hydrate(rows)}
+    return [by[u] for u in uuids if u in by]
+
+
+def total_count():
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) FROM screenshots").fetchone()[0]
+    conn.close()
+    return n
+
+
 def fetch_ocr(uuid):
     conn = db()
     row = conn.execute("SELECT ocr_text FROM screenshots WHERE uuid=?", (uuid,)).fetchone()
@@ -196,15 +248,90 @@ def fetch_ocr(uuid):
     return (row["ocr_text"] or "") if row else ""
 
 
-def search_uuids(q):
-    """Server-side full-text search across OCR / summary / filename / category."""
+def _keyword_uuids(q):
+    """Keyword (substring) matches across OCR / summary / filename / category,
+    ordered newest-first. This is the precision half of the hybrid search and
+    the sole result set when embeddings aren't available."""
     like = f"%{q}%"
     conn = db()
     rows = conn.execute(
         "SELECT uuid FROM screenshots WHERE ocr_text LIKE ? OR summary LIKE ? "
-        "OR filename LIKE ? OR category LIKE ?", (like, like, like, like)).fetchall()
+        "OR filename LIKE ? OR category LIKE ? "
+        "ORDER BY COALESCE(date_taken, date_added) DESC",
+        (like, like, like, like)).fetchall()
     conn.close()
     return [r["uuid"] for r in rows]
+
+
+_vec_unavailable = False   # remember a failed load so we don't retry every query
+_openai_client = None
+
+
+def _vec_conn():
+    """A DB connection with sqlite-vec loaded, or None if the extension or the
+    `vec_shots` table (with rows) isn't available."""
+    global _vec_unavailable
+    if _vec_unavailable:
+        return None
+    try:
+        import sqlite_vec
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        if not conn.execute("SELECT count(*) FROM vec_shots").fetchone()[0]:
+            conn.close()
+            return None
+        return conn
+    except Exception:
+        _vec_unavailable = True
+        return None
+
+
+def _embed_query(q):
+    """Embed the query string with the same model used for the corpus, or None
+    if there's no key / the call fails (caller falls back to keyword-only)."""
+    global _openai_client
+    if not os.environ.get("OPENAI_API_KEY"):
+        return None
+    try:
+        if _openai_client is None:
+            from openai import OpenAI
+            _openai_client = OpenAI(timeout=10)
+        r = _openai_client.embeddings.create(model=EMBED_MODEL, input=[q])
+        return r.data[0].embedding
+    except Exception:
+        return None
+
+
+def search_ranked(q):
+    """uuids ordered by relevance. Hybrid keyword+vector (RRF) when embeddings
+    are present; keyword-only (date-ordered) otherwise. Always returns a list in
+    rank order — the client renders search results in exactly this order."""
+    kw = _keyword_uuids(q)
+    vconn = _vec_conn()
+    emb = _embed_query(q) if vconn else None
+    if not vconn or emb is None:
+        if vconn:
+            vconn.close()
+        return kw  # graceful fallback: keyword-only
+
+    import sqlite_vec
+    vrows = vconn.execute(
+        "SELECT uuid FROM vec_shots WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+        (sqlite_vec.serialize_float32(emb), VEC_TOPK)).fetchall()
+    vconn.close()
+
+    # Reciprocal Rank Fusion: each list contributes 1/(K+rank); a shot that
+    # ranks well in BOTH keyword and vector lists rises to the top.
+    scores = {}
+    for rank, u in enumerate(kw):
+        scores[u] = scores.get(u, 0.0) + 1.0 / (RRF_K + rank + 1)
+    for rank, r in enumerate(vrows):
+        u = r["uuid"]
+        scores[u] = scores.get(u, 0.0) + 1.0 / (RRF_K + rank + 1)
+    return sorted(scores, key=scores.get, reverse=True)
 
 
 _BACKFILL_LINE = re.compile(
@@ -618,6 +745,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="chips" id="statusChips"></div>
   <div class="chips" id="sourceChips"></div>
   <div class="chips" id="catChips"></div>
+  <div class="chips" id="collections" title="One-click smart collections (semantic search)"></div>
   <div id="dateFilter" title="Filter by capture date">
     <span class="dfIcon">📅</span>
     <button class="chip dfPreset" data-days="7">7d</button>
@@ -733,6 +861,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 let DATA = [], cur = null, QMSGS = [];
 // status filter defaults to the "Needs review" queue — that's the inbox.
 const state = { q:"", cats:new Set(), sources:new Set(), status:new Set(["needs_review"]), qMatches:null,
+                qRank:null,                // uuid -> relevance index when a search is active
                 dateFrom:"", dateTo:"",    // capture-date range (yyyy-mm-dd), inclusive
                 sort: localStorage.getItem('shotSort') || 'newest' };  // 'newest' | 'oldest'
 const selected = new Set();  // uuids picked for bulk actions
@@ -757,10 +886,31 @@ function imgUrl(uuid, opts={}) {
   return '/img?' + p.toString();
 }
 
+let _libTotal = null;   // grand total across the whole library (for the header)
 async function load() {
-  DATA = await (await fetch('/api/screenshots')).json();
-  document.getElementById('total').textContent = '· ' + DATA.length;
-  await loadQmsgs();
+  if (state.q) {
+    // Search mode: global, relevance-ranked rows from the server (not limited
+    // to the loaded date/status window). The server returns rows in rank order.
+    const r = await (await fetch('/api/search?q=' + encodeURIComponent(state.q))).json();
+    DATA = r.rows || [];
+    state.qRank = new Map(DATA.map((d,i)=>[d.uuid,i]));
+    state.qMatches = new Set(DATA.map(d=>d.uuid));
+  } else {
+    // Browse mode: only the current window (default last 7 days + needs-review),
+    // so the browser never holds all 48k. Filters re-query the server.
+    state.qMatches = null; state.qRank = null;
+    const p = new URLSearchParams();
+    [...state.status].forEach(s => p.append('status', s));
+    if (state.dateFrom) p.set('from', state.dateFrom);
+    if (state.dateTo)   p.set('to', state.dateTo);
+    DATA = await (await fetch('/api/screenshots?' + p.toString())).json();
+  }
+  if (_libTotal === null) {
+    try { _libTotal = (await (await fetch('/api/screenshots?count=1')).json()).total; }
+    catch { _libTotal = DATA.length; }
+    await loadQmsgs();   // one-time; load() now runs on every filter change
+  }
+  document.getElementById('total').textContent = '· ' + _libTotal.toLocaleString();
   buildChips();
   render();
   updateBulkBar();
@@ -777,7 +927,7 @@ function buildChips() {
     const el = document.createElement('div');
     el.className = 'chip st-'+s + (state.status.has(s)?' on':'');
     el.textContent = STATUS_LABELS[s];
-    el.onclick=()=>{ state.status.has(s)?state.status.delete(s):state.status.add(s); el.classList.toggle('on'); render(); };
+    el.onclick=()=>{ state.status.has(s)?state.status.delete(s):state.status.add(s); el.classList.toggle('on'); load(); };
     sc.appendChild(el);
   });
   const srcs = [...new Set(DATA.map(d=>d.source).filter(Boolean))].sort();
@@ -799,19 +949,25 @@ function buildChips() {
 }
 
 function match(d) {
-  if (state.status.size && !state.status.has(d.status||'needs_review')) return false;
+  // Category/source are opt-in refinements that always apply (default empty).
   if (state.sources.size && !state.sources.has(d.source)) return false;
   if (state.cats.size && !state.cats.has(d.category)) return false;
+  if (state.q) {
+    // Search mode: results are global + ranked. Status/date windows don't
+    // constrain a search — you're looking across the whole library on purpose.
+    return !state.qMatches || state.qMatches.has(d.uuid);
+  }
+  // Browse mode: the server already windowed by status + date, but re-check
+  // client-side so chip toggles feel instant before a refetch lands.
+  if (state.status.size && !state.status.has(d.status||'needs_review')) return false;
   if (state.dateFrom || state.dateTo) {
     const iso = d.date_taken || d.date_added;
-    if (!iso) return false;                       // no date → excluded when filtering by date
+    if (!iso) return false;
     const t = new Date(iso).getTime();
     if (isNaN(t)) return false;
     if (state.dateFrom && t < new Date(state.dateFrom + 'T00:00:00').getTime()) return false;
     if (state.dateTo   && t > new Date(state.dateTo   + 'T23:59:59.999').getTime()) return false;
   }
-  // Full-text search is resolved server-side (OCR isn't shipped to the grid).
-  if (state.q && !(state.qMatches && state.qMatches.has(d.uuid))) return false;
   return true;
 }
 
@@ -845,11 +1001,11 @@ function setDateRange(from, to) {
   state.dateFrom = from || ""; state.dateTo = to || "";
   document.getElementById('dateFrom').value = state.dateFrom;
   document.getElementById('dateTo').value   = state.dateTo;
-  applyDateUI(); render();
+  applyDateUI(); load();   // date window is a server query now
 }
 function initDateFilter() {
-  document.getElementById('dateFrom').onchange = e => { state.dateFrom = e.target.value; applyDateUI(); render(); };
-  document.getElementById('dateTo').onchange   = e => { state.dateTo   = e.target.value; applyDateUI(); render(); };
+  document.getElementById('dateFrom').onchange = e => { state.dateFrom = e.target.value; applyDateUI(); load(); };
+  document.getElementById('dateTo').onchange   = e => { state.dateTo   = e.target.value; applyDateUI(); load(); };
   document.getElementById('dateClear').onclick = () => setDateRange("", "");
   document.querySelectorAll('.dfPreset').forEach(b => b.onclick = () => {
     const today = new Date().toISOString().slice(0,10);
@@ -863,10 +1019,16 @@ function initDateFilter() {
 function render() {
   const g = document.getElementById('grid');
   const items = DATA.filter(match);
-  // Sort by capture date; server already returns newest-first, but re-sort here
-  // so the toggle is authoritative and stable as rows stream in during backfill.
-  const dt = d => { const t = new Date(d.date_taken || d.date_added || 0).getTime(); return isNaN(t) ? 0 : t; };
-  items.sort((a,b) => state.sort === 'oldest' ? dt(a)-dt(b) : dt(b)-dt(a));
+  if (state.q && state.qRank) {
+    // Active search: the server ranked these by relevance (hybrid keyword+vector).
+    // Honor that order so the best matches sit at the top, not the newest.
+    items.sort((a,b) => (state.qRank.get(a.uuid) ?? 1e9) - (state.qRank.get(b.uuid) ?? 1e9));
+  } else {
+    // No query: sort by capture date. Server returns newest-first, but re-sort
+    // here so the toggle is authoritative and stable as rows stream in.
+    const dt = d => { const t = new Date(d.date_taken || d.date_added || 0).getTime(); return isNaN(t) ? 0 : t; };
+    items.sort((a,b) => state.sort === 'oldest' ? dt(a)-dt(b) : dt(b)-dt(a));
+  }
   shown = items;
   if (focusIdx > items.length-1) focusIdx = items.length-1;
   if (focusIdx < 0) focusIdx = 0;
@@ -1058,17 +1220,11 @@ function esc(s){ return (s||'').replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>
 
 let _searchTimer = null;
 document.getElementById('search').addEventListener('input', e=>{
-  const q = e.target.value.trim();
-  state.q = q; focusIdx = 0;
+  state.q = e.target.value.trim(); focusIdx = 0;
   clearTimeout(_searchTimer);
-  if (!q) { state.qMatches = null; render(); return; }
-  _searchTimer = setTimeout(async ()=>{
-    try {
-      const r = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json();
-      state.qMatches = new Set(r.uuids || []);
-    } catch { state.qMatches = new Set(); }
-    render();
-  }, 180);
+  // load() switches between search mode (global ranked rows) and browse mode
+  // (windowed) based on state.q, so a debounced reload covers both.
+  _searchTimer = setTimeout(load, 200);
 });
 document.getElementById('overlay').addEventListener('click', e=>{ if(e.target.id==='overlay') closeModal(); });
 
@@ -1231,11 +1387,10 @@ async function pollBackfill() {
   el.classList.add('on');
   document.getElementById('bfBar').style.width = (s.pct || 0) + '%';
   if (s.finished) {
-    el.classList.add('done');
-    document.getElementById('bfLabel').textContent = '✅ OCR backfill complete';
-    document.getElementById('bfStats').textContent =
-      (s.done || 0).toLocaleString() + ' / ' + (s.total || 0).toLocaleString() + ' screenshots';
-    if (_bfWasRunning) load();        // new rows landed — refresh the grid once
+    // Backfill is done — hide the banner entirely so it doesn't take up space.
+    // If it finished while you were watching, pull the new rows in once.
+    if (_bfWasRunning) { _bfWasRunning = false; load(); }
+    el.classList.remove('on', 'done');
     clearInterval(_bfTimer); _bfTimer = null;
     return;
   }
@@ -1261,8 +1416,54 @@ async function pollBackfill() {
 pollBackfill();
 _bfTimer = setInterval(pollBackfill, 5000);
 
+// Smart collections: one-click semantic searches. Clicking a chip runs the
+// hybrid search for that theme; results come back ranked by relevance. The
+// Stocks chip links to the mined price timeline (/stocks) instead.
+const COLLECTIONS = [
+  ["🧾 Receipts", "receipt invoice payment total amount paid"],
+  ["✈️ Travel", "flight confirmation boarding pass hotel booking itinerary"],
+  ["🍳 Recipes", "recipe ingredients cooking instructions food menu"],
+  ["💬 Tweets", "interesting tweet thread twitter X post"],
+  ["📅 Events", "event invitation rsvp date time venue"],
+  ["🔐 Logins/Wifi", "password wifi network login credentials code"],
+  ["📇 Contacts", "contact phone number email business card"],
+  ["🗺 Places", "map location address directions restaurant"],
+  ["💡 Ideas/Quotes", "inspirational quote idea note to self advice"],
+  ["🛒 To buy", "product price buy shopping wishlist amazon"],
+];
+function initCollections(){
+  const box = document.getElementById('collections');
+  // Stocks gets its own destination — the price timeline report.
+  const stocks = document.createElement('a');
+  stocks.className = 'chip'; stocks.textContent = '📈 Stocks ↗';
+  stocks.href = '/stocks'; stocks.target = '_blank';
+  stocks.title = 'Stock price timeline mined from your screenshots';
+  box.appendChild(stocks);
+  for (const [label, q] of COLLECTIONS){
+    const c = document.createElement('button');
+    c.className = 'chip'; c.textContent = label; c.title = 'Semantic search: ' + q;
+    c.onclick = ()=>{
+      const s = document.getElementById('search');
+      s.value = q; s.dispatchEvent(new Event('input', {bubbles:true}));
+      s.scrollIntoView({block:'nearest'});
+    };
+    box.appendChild(c);
+  }
+}
+
 initDateFilter();
 initSort();
+initCollections();
+// Friendly default view: the most recent 7 days that still need review, instead
+// of trying to load the whole library. status already defaults to needs_review.
+(function(){
+  const today = new Date().toISOString().slice(0,10);
+  state.dateFrom = new Date(Date.now() - 7*864e5).toISOString().slice(0,10);
+  state.dateTo = today;
+  document.getElementById('dateFrom').value = state.dateFrom;
+  document.getElementById('dateTo').value = state.dateTo;
+  applyDateUI();
+})();
 load();
 </script>
 </body>
@@ -1291,15 +1492,31 @@ class Handler(BaseHTTPRequestHandler):
                     .replace("__ACTION_ENABLED__", "true" if ACTION_ENABLED else "false")
                     .replace("__BOT_NAME__", json.dumps(BOT_NAME)))
             return self._send(200, html, "text/html; charset=utf-8")
+        if u.path == "/stocks":
+            # Stock price timeline mined from screenshots (stock_report.py).
+            f = HOME / "stock_timeline.html"
+            if f.exists():
+                return self._send(200, f.read_text(), "text/html; charset=utf-8")
+            return self._send(404, "Run stock_extract.py then stock_report.py first.", "text/plain")
         if u.path == "/api/screenshots":
-            return self._send(200, json.dumps(fetch_all()))
+            qs = parse_qs(u.query)
+            if qs.get("count"):
+                return self._send(200, json.dumps({"total": total_count()}))
+            statuses = [s for s in qs.get("status", []) if s]
+            date_from = (qs.get("from") or [""])[0] or None
+            date_to = (qs.get("to") or [""])[0] or None
+            return self._send(200, json.dumps(
+                fetch_all(statuses or None, date_from, date_to)))
         if u.path == "/api/ocr":
             uuid = (parse_qs(u.query).get("id") or [""])[0]
             return self._send(200, json.dumps({"ocr_text": fetch_ocr(uuid)}))
         if u.path == "/api/search":
             q = (parse_qs(u.query).get("q") or [""])[0].strip()
-            uuids = search_uuids(q) if q else []
-            return self._send(200, json.dumps({"uuids": uuids}))
+            uuids = search_ranked(q) if q else []
+            # Return ranked ROWS too, so the grid can render global search results
+            # without them having to be in the currently-loaded date/status window.
+            return self._send(200, json.dumps(
+                {"uuids": uuids, "rows": fetch_rows_by_uuids(uuids)}))
         if u.path == "/api/quickmsgs":
             return self._send(200, json.dumps({"messages": load_quick_messages()}))
         if u.path == "/api/backfill":

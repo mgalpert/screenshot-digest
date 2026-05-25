@@ -117,6 +117,63 @@ What it does for you:
 
 ---
 
+## Semantic search (vector embeddings + hybrid) — `screenshot_embed.py`
+
+Keyword search only finds your *exact* words. Embeddings let you search by
+*meaning* — "thing I need to pay" surfaces receipts; "from AI to AGI" finds the
+infographic even though those words never appear in it. At tens of thousands of
+shots this is the difference between drowning and finding.
+
+**How it works:** `screenshot_embed.py` embeds each screenshot's text (its AI
+summary + OCR, summary first as the highest-signal part) with OpenAI
+`text-embedding-3-small` (1536-dim) and stores the vectors in a
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec) `vec0` table **inside the
+same `screenshots.db`** (keyed by screenshot uuid). The viewer's `/api/search`
+then fuses two ranked lists — keyword (precision) and vector (meaning) — with
+**Reciprocal Rank Fusion** and returns results ordered by relevance.
+
+### Create the embeddings
+
+```bash
+pip install sqlite-vec openai
+export OPENAI_API_KEY=sk-...
+
+python3 screenshot_embed.py            # embed everything missing
+python3 screenshot_embed.py --limit 200   # smoke-test on 200 shots
+python3 screenshot_embed.py --status      # how many embedded vs pending
+```
+
+- **Cheap + fast** — `text-embedding-3-small` is ~$0.02 / 1M tokens, so a ~50k
+  library is well under a dollar and embeds in minutes (batched 100/req).
+- **Resumable** — skips anything already embedded; safe to re-run anytime
+  (e.g. after a new OCR backfill adds more text).
+- **Self-contained** — vectors live in the same DB file. They're *derived* data:
+  if you ever want to slim the DB (or a backup), drop the `vec_shots` table and
+  re-run this in minutes. (The included `backup_db.sh` strips it automatically.)
+
+Once embedded, search in the viewer (or via the API below) is automatically
+hybrid. **No embeddings or no `OPENAI_API_KEY`? Search transparently falls back
+to keyword-only** — nothing breaks, you just lose the semantic ranking.
+
+> **Bonus — pattern mining.** Because the text is now both searchable and
+> vectorized, you can mine *structured* facts out of it. `stock_extract.py` +
+> `stock_report.py` are a worked example: they gather your stock/crypto
+> screenshots (via this same hybrid search), pull `{ticker, price, date}` from
+> the OCR with an LLM, and render a price-over-time timeline (served at the
+> viewer's `/stocks`). Use it as a template for any "find a category → extract →
+> chart" workflow.
+
+### Let an agent search it — the `search-screenshots` skill
+
+`skills/search-screenshots/SKILL.md` packages this for an AI agent (Claude Code,
+OpenClaw, etc.): point your agent at it and you can say *"find my screenshot
+about X and send it to me."* The skill documents the whole loop — ensure the
+viewer is running, call `/api/search?q=…`, take the top-ranked uuid, and fetch
+the actual image from `/img?id=<uuid>&full=1` to hand back. See that file for
+the copy-paste recipe.
+
+---
+
 ## CLI reference (`screenshot_digest.py`)
 
 ```bash
@@ -249,7 +306,10 @@ A compact, machine-readable summary so an agent can drive this without reading p
 platform: macOS, Python 3.10+
 entrypoints:
   ingest: python3 screenshot_digest.py [--all|--days N] [--desktop] [--local] [--report]
+  backfill: python3 screenshot_backfill.py [--workers N] [--rpm N]   # bulk OCR a big library
+  embed: python3 screenshot_embed.py [--limit N] [--status]          # build search vectors
   viewer: python3 screenshot_viewer.py [--port 8765] [--host 127.0.0.1]
+agent_skill: skills/search-screenshots/SKILL.md   # "find a screenshot about X" recipe
 data_home: $SCREENSHOT_DIGEST_HOME (default ~/.screenshot-digest)
 database: $data_home/screenshots.db   # SQLite, table: screenshots
 quick_messages: $data_home/quick_messages.json   # JSON array of reusable instructions
@@ -264,7 +324,8 @@ source_values: [photos, desktop]
 viewer_http_api:                      # localhost only
   GET  /api/screenshots               # -> rows WITHOUT full ocr_text (ships ocr_len)
   GET  /api/ocr?id=<uuid>             # -> {ocr_text} for one shot (lazy-loaded)
-  GET  /api/search?q=<term>           # -> {uuids:[...]} full-text match, server-side
+  GET  /api/search?q=<term>           # -> {uuids:[...], rows:[...]} hybrid keyword+vector, ranked
+  GET  /api/screenshots?status=&from=&to=&count=  # windowed grid rows (or {total} with count=1)
   GET  /api/quickmsgs                 # -> {messages: [...]}
   GET  /img?id=<uuid>[&full=1][&download=1]   # thumbnails disk-cached by path+mtime+size
   POST /api/update   {uuid, category?|status?|summary?|ocr_text?}

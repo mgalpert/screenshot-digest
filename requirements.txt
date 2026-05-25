@@ -8,3 +8,9 @@ ocrmac>=1.0        # Apple Vision OCR (the local engine)
 # Pillow downscales images to ~900px JPEGs for the grid; without it the viewer
 # serves the raw full-size files instead.
 # pillow>=10
+
+# Optional: semantic / hybrid search (screenshot_embed.py + the viewer's
+# /api/search). Embeds OCR text and stores vectors in the SAME screenshots.db;
+# without these the viewer's search transparently falls back to keyword-only.
+# sqlite-vec>=0.1.9    # vector index (vec0 virtual table)
+# openai>=1.0          # text-embedding-3-small for corpus + query embeddings
