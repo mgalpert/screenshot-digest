@@ -51,6 +51,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -206,6 +207,91 @@ def search_uuids(q):
     return [r["uuid"] for r in rows]
 
 
+_BACKFILL_LINE = re.compile(
+    r"(\d+)/(\d+)\s+\(([\d.]+)/min,\s*ETA\s*([\d.]+)\s*min\)")
+# "48117 in library, 113 already done, 48001 to process"
+_BACKFILL_ENUM = re.compile(
+    r"(\d+) in library,\s*(\d+) already done,\s*(\d+) to process")
+
+
+def backfill_status():
+    """Live status of a running screenshot_backfill.py, surfaced to the UI.
+
+    Progress is read LIVE from the DB row count (the source of truth, updates
+    every row) rather than the log's every-50-items milestone — otherwise the
+    bar visibly stalls between milestones, especially when the adaptive
+    throttle slows the run. The log is still parsed for the run's framing
+    (total to process, baseline already-done, last rate/ETA) and to detect the
+    process. The log lives next to the DB so this stays portable.
+    """
+    log_path = HOME / "backfill.log"
+    if not log_path.exists():
+        return {"active": False}
+
+    # Read just the tail — the log can grow to tens of thousands of lines.
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 16384))
+            tail = f.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return {"active": False}
+
+    total = baseline = rate = eta = None
+    log_done = None
+    finished = False
+    ts = ""
+    for line in tail:
+        if " [backfill] DONE" in line:
+            finished = True
+            ts = line[:19]
+        e = _BACKFILL_ENUM.search(line)
+        if e:                               # last run's framing
+            baseline, total = int(e.group(2)), int(e.group(3))
+        m = _BACKFILL_LINE.search(line)
+        if m:
+            log_done = int(m.group(1))
+            total = int(m.group(2))
+            rate, eta = float(m.group(3)), float(m.group(4))
+            ts = line[:19]
+
+    try:
+        running = subprocess.run(
+            ["pgrep", "-f", "screenshot_backfill.py"],
+            capture_output=True, timeout=3).returncode == 0
+    except Exception:
+        running = False
+
+    if total is None and not running:
+        return {"active": False}
+
+    # Live done: rows in the DB now, minus the baseline that existed when this
+    # run started. Falls back to the log's milestone count if we can't frame it.
+    done = log_done or 0
+    if baseline is not None:
+        try:
+            conn = db()
+            db_count = conn.execute("SELECT COUNT(*) FROM screenshots").fetchone()[0]
+            conn.close()
+            done = max(done, db_count - baseline)
+        except Exception:
+            pass
+    if total:
+        done = min(done, total)
+
+    pct = round(done / total * 100, 1) if (done and total) else 0
+    # Recompute ETA from live progress + last observed rate (log ETA goes stale).
+    if rate and total and done < total:
+        eta = (total - done) / rate
+    return {
+        "active": True, "running": running, "finished": finished and not running,
+        "done": done, "total": total, "pct": pct,
+        "rate": round(rate) if rate else 0,
+        "eta_min": round(eta) if eta else 0, "ts": ts,
+    }
+
+
 def _build_prompt(row, instruction, inc):
     parts = ["📸 Screenshot action (from the screenshot viewer).\n"]
     if inc["meta"]:
@@ -339,6 +425,29 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .chip.st-reviewed.on{background:var(--keep);border-color:var(--keep);color:var(--on-fill)}
   .chip.st-archived.on{background:var(--archived);border-color:var(--archived);color:var(--on-fill)}
   #count { color:var(--muted); font-size:12px; margin-left:auto; font-variant-numeric:tabular-nums; }
+  #dateFilter { display:flex; align-items:center; gap:5px; background:var(--panel2);
+                padding:3px 7px; border-radius:9px; }
+  #dateFilter .dfIcon { font-size:13px; }
+  #dateFilter .dfDash { color:var(--muted); }
+  #dateFilter input[type=date] { background:var(--panel); border:1px solid var(--line);
+                color:var(--txt); border-radius:7px; padding:3px 6px; font-size:12px;
+                font-family:inherit; color-scheme:light dark; }
+  #dateFilter .dfPreset { padding:4px 9px; }
+  #dateFilter .dfPreset.on { background:var(--accent); color:#fff; }
+  #dateFilter .dfClear { padding:4px 8px; display:none; }
+  #dateFilter.active .dfClear { display:inline-block; }
+  #backfill { display:none; position:sticky; top:0; z-index:19; align-items:center; gap:12px;
+              padding:8px 22px; background:var(--panel2); border-bottom:1px solid var(--line);
+              font-size:12px; color:var(--txt); font-variant-numeric:tabular-nums; }
+  #backfill.on { display:flex; }
+  #backfill #bfLabel { font-weight:700; white-space:nowrap; }
+  #backfill #bfTrack { flex:1; height:8px; min-width:120px; background:var(--bg);
+              border-radius:99px; overflow:hidden; border:1px solid var(--line); }
+  #backfill #bfBar { height:100%; width:0%; border-radius:99px;
+              background:linear-gradient(90deg,var(--accent),#7c5cff); transition:width .6s ease; }
+  #backfill #bfStats { color:var(--muted); white-space:nowrap; }
+  #backfill.done #bfBar { background:linear-gradient(90deg,#22c55e,#16a34a); }
+  #backfill.done #bfLabel { color:#16a34a; }
   main { padding:20px 22px 90px; columns: var(--col, 220px); column-gap:16px; }
   #sizeToggle { display:flex; gap:2px; background:var(--panel2); padding:2px; border-radius:9px; }
   #sizeToggle button { padding:5px 10px; border-radius:7px; border:none;
@@ -509,6 +618,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="chips" id="statusChips"></div>
   <div class="chips" id="sourceChips"></div>
   <div class="chips" id="catChips"></div>
+  <div id="dateFilter" title="Filter by capture date">
+    <span class="dfIcon">📅</span>
+    <button class="chip dfPreset" data-days="7">7d</button>
+    <button class="chip dfPreset" data-days="30">30d</button>
+    <button class="chip dfPreset" data-days="365">1y</button>
+    <input type="date" id="dateFrom" title="From (capture date)">
+    <span class="dfDash">–</span>
+    <input type="date" id="dateTo" title="To (capture date)">
+    <button class="chip dfClear" id="dateClear" title="Clear date filter">✕</button>
+  </div>
+  <button id="sortBtn" class="chip" title="Toggle sort order (capture date)"></button>
   <button id="selectAllBtn" class="chip" onclick="selectAllShown()">☑ Select all</button>
   <div id="kbdHint" onclick="toggleHelp()" title="Keyboard shortcuts (press ?)">⌨ shortcuts</div>
   <button id="themeBtn" onclick="toggleTheme()" title="Toggle light / dark"></button>
@@ -518,6 +638,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   </div>
   <div id="count"></div>
 </header>
+<div id="backfill" title="OCR backfill progress">
+  <span id="bfLabel">Backfilling OCR…</span>
+  <div id="bfTrack"><div id="bfBar"></div></div>
+  <span id="bfStats"></span>
+</div>
 <main id="grid"></main>
 
 <div id="bulkbar">
@@ -607,7 +732,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 let DATA = [], cur = null, QMSGS = [];
 // status filter defaults to the "Needs review" queue — that's the inbox.
-const state = { q:"", cats:new Set(), sources:new Set(), status:new Set(["needs_review"]), qMatches:null };
+const state = { q:"", cats:new Set(), sources:new Set(), status:new Set(["needs_review"]), qMatches:null,
+                dateFrom:"", dateTo:"",    // capture-date range (yyyy-mm-dd), inclusive
+                sort: localStorage.getItem('shotSort') || 'newest' };  // 'newest' | 'oldest'
 const selected = new Set();  // uuids picked for bulk actions
 let shown = [];      // the currently-filtered items, in display order
 let focusIdx = 0;    // keyboard focus cursor into `shown`
@@ -641,6 +768,11 @@ async function load() {
 
 function buildChips() {
   const sc = document.getElementById('statusChips');
+  // Clear first — load() re-runs this on every backfill auto-refresh, so without
+  // resetting, chips would stack up duplicated on each reload.
+  sc.innerHTML = '';
+  document.getElementById('sourceChips').innerHTML = '';
+  document.getElementById('catChips').innerHTML = '';
   STATUSES.forEach(s => {
     const el = document.createElement('div');
     el.className = 'chip st-'+s + (state.status.has(s)?' on':'');
@@ -670,14 +802,71 @@ function match(d) {
   if (state.status.size && !state.status.has(d.status||'needs_review')) return false;
   if (state.sources.size && !state.sources.has(d.source)) return false;
   if (state.cats.size && !state.cats.has(d.category)) return false;
+  if (state.dateFrom || state.dateTo) {
+    const iso = d.date_taken || d.date_added;
+    if (!iso) return false;                       // no date → excluded when filtering by date
+    const t = new Date(iso).getTime();
+    if (isNaN(t)) return false;
+    if (state.dateFrom && t < new Date(state.dateFrom + 'T00:00:00').getTime()) return false;
+    if (state.dateTo   && t > new Date(state.dateTo   + 'T23:59:59.999').getTime()) return false;
+  }
   // Full-text search is resolved server-side (OCR isn't shipped to the grid).
   if (state.q && !(state.qMatches && state.qMatches.has(d.uuid))) return false;
   return true;
 }
 
+// ---- sort order (persisted) ----
+function applySortUI() {
+  const b = document.getElementById('sortBtn');
+  b.textContent = state.sort === 'oldest' ? '↑ Oldest first' : '↓ Newest first';
+}
+function initSort() {
+  const b = document.getElementById('sortBtn');
+  applySortUI();
+  b.onclick = () => {
+    state.sort = state.sort === 'oldest' ? 'newest' : 'oldest';
+    localStorage.setItem('shotSort', state.sort);
+    applySortUI(); render();
+  };
+}
+
+// ---- date-range filter wiring ----
+function applyDateUI() {
+  const wrap = document.getElementById('dateFilter');
+  wrap.classList.toggle('active', !!(state.dateFrom || state.dateTo));
+  // A preset highlights only when the range exactly matches "last N days → today".
+  const today = new Date().toISOString().slice(0,10);
+  document.querySelectorAll('.dfPreset').forEach(b => {
+    const from = new Date(Date.now() - b.dataset.days*864e5).toISOString().slice(0,10);
+    b.classList.toggle('on', state.dateTo===today && state.dateFrom===from);
+  });
+}
+function setDateRange(from, to) {
+  state.dateFrom = from || ""; state.dateTo = to || "";
+  document.getElementById('dateFrom').value = state.dateFrom;
+  document.getElementById('dateTo').value   = state.dateTo;
+  applyDateUI(); render();
+}
+function initDateFilter() {
+  document.getElementById('dateFrom').onchange = e => { state.dateFrom = e.target.value; applyDateUI(); render(); };
+  document.getElementById('dateTo').onchange   = e => { state.dateTo   = e.target.value; applyDateUI(); render(); };
+  document.getElementById('dateClear').onclick = () => setDateRange("", "");
+  document.querySelectorAll('.dfPreset').forEach(b => b.onclick = () => {
+    const today = new Date().toISOString().slice(0,10);
+    const from  = new Date(Date.now() - b.dataset.days*864e5).toISOString().slice(0,10);
+    // Clicking an already-active preset toggles it off.
+    if (state.dateTo===today && state.dateFrom===from) setDateRange("", "");
+    else setDateRange(from, today);
+  });
+}
+
 function render() {
   const g = document.getElementById('grid');
   const items = DATA.filter(match);
+  // Sort by capture date; server already returns newest-first, but re-sort here
+  // so the toggle is authoritative and stable as rows stream in during backfill.
+  const dt = d => { const t = new Date(d.date_taken || d.date_added || 0).getTime(); return isNaN(t) ? 0 : t; };
+  items.sort((a,b) => state.sort === 'oldest' ? dt(a)-dt(b) : dt(b)-dt(a));
   shown = items;
   if (focusIdx > items.length-1) focusIdx = items.length-1;
   if (focusIdx < 0) focusIdx = 0;
@@ -1031,6 +1220,49 @@ function setSize(w){
 document.querySelectorAll('#sizeToggle button').forEach(b=> b.onclick=()=>setSize(b.dataset.w));
 setSize(localStorage.getItem('shotColW') || '190');
 
+// ---- OCR backfill progress banner (polls while a backfill is running) ----
+let _bfTimer = null, _bfWasRunning = false, _bfPolls = 0, _bfLastDone = 0;
+async function pollBackfill() {
+  let s;
+  try { s = await (await fetch('/api/backfill')).json(); }
+  catch { return; }
+  const el = document.getElementById('backfill');
+  if (!s.active) { el.classList.remove('on'); return; }
+  el.classList.add('on');
+  document.getElementById('bfBar').style.width = (s.pct || 0) + '%';
+  if (s.finished) {
+    el.classList.add('done');
+    document.getElementById('bfLabel').textContent = '✅ OCR backfill complete';
+    document.getElementById('bfStats').textContent =
+      (s.done || 0).toLocaleString() + ' / ' + (s.total || 0).toLocaleString() + ' screenshots';
+    if (_bfWasRunning) load();        // new rows landed — refresh the grid once
+    clearInterval(_bfTimer); _bfTimer = null;
+    return;
+  }
+  _bfWasRunning = true;
+  el.classList.remove('done');
+  document.getElementById('bfLabel').textContent =
+    s.running ? '⏳ Backfilling OCR…' : '⏸ Backfill paused';
+  const eta = s.eta_min >= 60 ? (s.eta_min/60).toFixed(1)+'h' : s.eta_min+'m';
+  document.getElementById('bfStats').textContent =
+    (s.done||0).toLocaleString() + ' / ' + (s.total||0).toLocaleString() +
+    '  ·  ' + s.pct + '%  ·  ' + (s.rate||0) + '/min  ·  ETA ' + eta;
+  // Pull freshly-processed shots into the grid periodically (every ~20s) while
+  // running, so the library visibly fills in — but only when the count actually
+  // moved, and skip it while a modal is open so we don't yank the view.
+  _bfPolls++;
+  // Only refresh when it won't disrupt you: count moved, not mid-modal, and
+  // you're near the top of the page (so we don't yank the grid while you scroll).
+  if (s.done !== _bfLastDone && _bfPolls % 4 === 0 && !modalOpen() && window.scrollY < 200) {
+    _bfLastDone = s.done;
+    load();
+  }
+}
+pollBackfill();
+_bfTimer = setInterval(pollBackfill, 5000);
+
+initDateFilter();
+initSort();
 load();
 </script>
 </body>
@@ -1070,6 +1302,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"uuids": uuids}))
         if u.path == "/api/quickmsgs":
             return self._send(200, json.dumps({"messages": load_quick_messages()}))
+        if u.path == "/api/backfill":
+            return self._send(200, json.dumps(backfill_status()))
         if u.path == "/img":
             # uuid travels as a query param (?id=), NOT a path segment: desktop
             # uuids are "desktop:<filename>" and macOS screenshot names contain a

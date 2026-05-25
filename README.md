@@ -88,6 +88,35 @@ viewer reads the same DB live, so new shots show up as soon as they're processed
 
 ---
 
+## Bulk backfill for large libraries (`screenshot_backfill.py`)
+
+`screenshot_digest.py --all` processes serially — fine for a few hundred shots, slow
+for tens of thousands. For a big backlog use the dedicated backfill runner, which is
+built to grind through a huge library safely while you keep using your machine:
+
+```bash
+python3 screenshot_backfill.py                 # whole library + Desktop
+python3 screenshot_backfill.py --limit 20      # smoke-test on 20 unprocessed shots
+python3 screenshot_backfill.py --workers 6 --rpm 600
+python3 screenshot_backfill.py --status        # how many are done, then exit
+```
+
+What it does for you:
+
+- **Resumable** — skips anything already in the DB and commits after every row, so
+  you can kill it (Ctrl-C, reboot, crash) and just re-run to pick up where it stopped.
+- **Won't get rate-limited** — an adaptive throttle widens request spacing on a 429/503
+  and narrows it again after a clean streak, converging on the fastest sustainable rate.
+- **Won't hang the run** — short per-request timeout + capped retries; a stuck network
+  read falls back to local OCR instead of pinning a worker.
+- **Gentle on the machine** — a small bounded worker pool (default 6); run it under
+  `nice` and it stays out of your way. The Gemini path does OCR server-side, so local
+  CPU stays near-idle.
+- **Visible** — logs progress + ETA to `backfill.log` (next to the DB), and the viewer
+  shows a **live progress bar** while it runs (see below).
+
+---
+
 ## CLI reference (`screenshot_digest.py`)
 
 ```bash
@@ -133,6 +162,12 @@ python3 screenshot_viewer.py --port 9000
 - **Live text filter** across OCR text, summary, filename, and category.
 - **Filter chips** for triage status, **category**, and **source** (📱 iPhone /
   🖥 Desktop). Each card shows its source badge and capture date.
+- **Date filter** — `7d` / `30d` / `1y` quick presets plus a custom From/To range,
+  filtering by capture date. Composes with every other filter.
+- **Sort toggle** — newest-first ↔ oldest-first by capture date (remembered).
+- **Live backfill progress bar** — while `screenshot_backfill.py` is running, a bar
+  shows done / total / rate / ETA and the grid fills in as shots are processed. Hidden
+  when no backfill is running.
 - **Triage lifecycle.** Every shot is **Needs review → Reviewed → Archived**. New
   shots land in *Needs review* and the view opens to that queue (an inbox). Acting on
   a shot — sending it to the bot, or setting a status — moves it along; *Archived* is
