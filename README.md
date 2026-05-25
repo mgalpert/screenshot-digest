@@ -303,6 +303,50 @@ sqlite3 ~/.screenshot-digest/screenshots.db \
 
 ---
 
+## Back up your database (`backup_db.sh`)
+
+The DB is the one irreplaceable artifact here — re-running OCR on a big library
+costs hours (and API spend). `backup_db.sh` snapshots it to a git repo on a
+schedule.
+
+Two things it gets right that a naive `git add screenshots.db` does not:
+
+- **Consistent snapshots.** It uses the sqlite3 `.backup` command, which copies a
+  clean, openable database even while a backfill is actively writing. Plain `cp`
+  of a live SQLite file can capture a torn, corrupt copy.
+- **Privacy.** The DB holds OCR'd text in cleartext (see the warning above), so
+  the backup repo **must be private**. The script requires you to point it at a
+  remote — make sure that remote is a **private** repo.
+
+```bash
+# 1. Create a PRIVATE backup repo (GitHub example)
+gh repo create screenshots-db-backup --private
+
+# 2. Point the script at it and run
+export BACKUP_REPO=git@github.com:you/screenshots-db-backup.git   # PRIVATE
+./backup_db.sh
+```
+
+It clones the backup repo once (to `~/.cache/screenshot-backup`), snapshots every
+valid SQLite `.db` in your `SCREENSHOT_DIGEST_HOME`, gzips each, and commits +
+pushes only when something changed. Re-running just overwrites with a fresh
+snapshot — safe anytime, including mid-backfill.
+
+Schedule it nightly with cron:
+
+```cron
+# every night at 3am — back up the DB to the private repo
+0 3 * * *  BACKUP_REPO=git@github.com:you/screenshots-db-backup.git /path/to/backup_db.sh >> ~/screenshot-backup.log 2>&1
+```
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `BACKUP_REPO` | *(required)* | git remote of a **private** backup repo |
+| `DIGEST_HOME` | `$SCREENSHOT_DIGEST_HOME` or `~/.screenshot-digest` | where the DB lives |
+| `BACKUP_DIR` | `~/.cache/screenshot-backup` | local working clone of the backup repo |
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
